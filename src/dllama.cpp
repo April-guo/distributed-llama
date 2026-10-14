@@ -51,7 +51,7 @@ static void inference(AppInferenceContext *context) {
         context->inference->forward();
 
         pos += batchSize;
-        token = inputTokens[pos + 1];
+        token = inputTokens[pos];
 
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);

@@ -479,7 +479,7 @@ public:
         fflush(stdout);
 
         NnUint pos = startPos;
-        int token;
+        int token = promptTokens[0];
         for (NnUint i = 0; ;) {
             long remainingTokens = promptEndPos - pos;
             if (remainingTokens <= 0)
@@ -498,7 +498,7 @@ public:
 
             i += batchSize;
             pos += batchSize;
-            token = promptTokens[i + 1];
+            token = promptTokens[i];
         }
 
         inference->setBatchSize(1);
