@@ -52,6 +52,9 @@ static uint64_t calcStringHash(const char *s) {
 Tokenizer::Tokenizer(const char* tokenizerPath)
     : eosTokenIds() {
     bosId = -1;
+    // Tokenizer files without the ADD_BOS key (written before it existed) keep the
+    // old behavior: add BOS at the start of a prompt. Uninitialized, this was random.
+    addBos = true;
     chatTemplate = nullptr;
     maxTokenLength = 0;
 
