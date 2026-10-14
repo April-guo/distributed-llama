@@ -513,6 +513,21 @@ public:
             token = sampler->sample(inference->logitsPipe);
 
             char *piece = tokenizer->decode(token);
+
+            if (params.ignore_eos) {
+                // Benchmark mode: no EOS or stop-string detection, so exactly max_tokens
+                // tokens are generated, and one chunk is sent per token so a client can
+                // time every token. A token whose UTF-8 bytes are incomplete sends "".
+                std::string deltaStr(piece == nullptr ? "" : piece);
+                printf("%s", deltaStr.c_str());
+                fflush(stdout);
+                if (params.stream)
+                    writeChatCompletionChunk(request, deltaStr, false);
+                buffer += deltaStr;
+                pos++;
+                continue;
+            }
+
             EosDetectorType eosType = eosDetector->append(token, piece);
 
             if (piece != nullptr) {

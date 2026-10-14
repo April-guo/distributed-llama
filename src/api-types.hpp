@@ -166,6 +166,7 @@ struct InferenceParams {
     float top_p;
     std::vector<std::string> stop;
     bool stream;
+    bool ignore_eos;
     unsigned long long seed;
     std::vector<Tool> tools;
     ToolChoice tool_choice;
@@ -346,6 +347,7 @@ InferenceParams parseInferenceParams(json &json, float defaultTemperature, float
     params.top_p = defaultTopp;
     params.seed = defaultSeed;
     params.stream = false;
+    params.ignore_eos = false;
     params.messages = parseChatMessages(json["messages"]);
     params.max_tokens = -1;
     params.tools.clear();
@@ -359,6 +361,8 @@ InferenceParams parseInferenceParams(json &json, float defaultTemperature, float
         params.seed = json["seed"].template get<unsigned long long>();
     if (json.contains("max_tokens"))
         params.max_tokens = json["max_tokens"].template get<int>();
+    if (json.contains("ignore_eos"))
+        params.ignore_eos = json["ignore_eos"].get<bool>();
     if (json.contains("tools") && json["tools"].is_array()) {
         for (const auto &toolItem : json["tools"]) {
             Tool tool;
