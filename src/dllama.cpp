@@ -9,6 +9,34 @@
 #include "app.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+
+// --logits-log: one line per forward with a hash of the raw logits, to check that two setups
+// (e.g. one node and a pipeline) compute bit-identical logits
+static uint64_t hashBytes(const void *data, NnSize nBytes) {
+    const unsigned char *bytes = (const unsigned char *)data;
+    uint64_t hash = 14695981039346656037ull; // FNV-1a
+    for (NnSize i = 0; i < nBytes; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static void logLogits(FILE *file, const char *kind, NnUint pos, NnUint batchSize, const float *logits, NnUint vocabSize) {
+    if (file == nullptr)
+        return;
+    const float *last = &logits[(NnSize)(batchSize - 1) * vocabSize];
+    NnUint argmax = 0;
+    for (NnUint i = 1; i < vocabSize; i++) {
+        if (last[i] > last[argmax])
+            argmax = i;
+    }
+    fprintf(file, "%s,%u,%u,%016llx,%u,%.9g\n", kind, pos, batchSize,
+        (unsigned long long)hashBytes(logits, (NnSize)batchSize * vocabSize * sizeof(float)), argmax, last[argmax]);
+    fflush(file);
+}
 
 static void inference(AppInferenceContext *context) {
     if (context->args->prompt == nullptr)
@@ -32,6 +60,17 @@ static void inference(AppInferenceContext *context) {
     NnSize recvBytes = 0;
     NnUint evalTotalTime = 0;
     NnUint predTotalTime = 0;
+    // With a pipeline the root executor only embeds tokens, so a forward is timed on the wall clock
+    const bool isPipeline = context->inference->nStages > 0;
+    Timer forwardTimer;
+
+    std::unique_ptr<FILE, int(*)(FILE *)> logitsLog(nullptr, fclose);
+    if (context->args->logitsLogPath != nullptr) {
+        logitsLog.reset(fopen(context->args->logitsLogPath, "w"));
+        if (!logitsLog)
+            throw std::runtime_error("Cannot open the logits log");
+        fprintf(logitsLog.get(), "# <eval|pred>,<pos>,<batch_size>,<fnv1a64 of all logits>,<argmax of the last row>,<its logit>\n");
+    }
 
     int token = inputTokens[pos];
     printf("%s\n", context->args->prompt);
@@ -48,7 +87,10 @@ static void inference(AppInferenceContext *context) {
         for (NnUint i = 0; i < batchSize; i++)
             context->inference->setToken(i, inputTokens[pos + i]);
 
+        forwardTimer.reset();
         context->inference->forward();
+        const NnUint wallTime = forwardTimer.elapsedMicroseconds();
+        logLogits(logitsLog.get(), "eval", pos, batchSize, context->inference->logitsPipe, context->header->vocabSize);
 
         pos += batchSize;
         token = inputTokens[pos];
@@ -56,8 +98,8 @@ static void inference(AppInferenceContext *context) {
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
 
-        NnUint evalTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
-        NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
+        NnUint evalTime = isPipeline ? wallTime : context->executor->getTotalTime(STEP_EXECUTE_OP);
+        NnUint syncTime = isPipeline ? 0 : context->executor->getTotalTime(STEP_SYNC_NODES);
         printf("🔷️ Eval%5u ms Sync%5u ms | Sent%6zu kB Recv%6zu kB | (%d tokens)\n",
             evalTime / 1000,
             syncTime / 1000,
@@ -76,7 +118,10 @@ static void inference(AppInferenceContext *context) {
     for (; pos < maxPos; pos++) {
         context->inference->setPosition(pos);
         context->inference->setToken(0, token);
+        forwardTimer.reset();
         context->inference->forward();
+        const NnUint wallTime = forwardTimer.elapsedMicroseconds();
+        logLogits(logitsLog.get(), "pred", pos, 1, context->inference->logitsPipe, context->header->vocabSize);
 
         token = context->sampler->sample(context->inference->logitsPipe);
 
@@ -85,8 +130,8 @@ static void inference(AppInferenceContext *context) {
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
 
-        NnUint predTime = context->executor->getTotalTime(STEP_EXECUTE_OP);
-        NnUint syncTime = context->executor->getTotalTime(STEP_SYNC_NODES);
+        NnUint predTime = isPipeline ? wallTime : context->executor->getTotalTime(STEP_EXECUTE_OP);
+        NnUint syncTime = isPipeline ? 0 : context->executor->getTotalTime(STEP_SYNC_NODES);
         printf("🔶 Pred%5u ms Sync%5u ms | Sent%6zu kB Recv%6zu kB | %s\n",
             predTime / 1000,
             syncTime / 1000,
