@@ -34,7 +34,10 @@ enum TokenizerHeaderKey {
     ADD_BOS = 10,
 };
 
+class TokenDecoder;
+
 class Tokenizer {
+    friend class TokenDecoder;
 private:
     unsigned int maxTokenLength;
     unsigned int regularVocabSize;
@@ -45,8 +48,7 @@ private:
     std::unordered_map<uint64_t, std::vector<int>> regularVocab;
     size_t strBufferSize;
     char *strBuffer;
-    char *utf8Buffer;
-    size_t strBufferPos;
+    TokenDecoder *decoder;
 
 
 public:
@@ -66,7 +68,23 @@ public:
     bool isEos(int token);
     char *decode(int token);
     void resetDecoder();
+};
 
+// Detokenizer state of one output stream: the bytes of an incomplete UTF-8 character are kept
+// until the next token completes it. Each concurrently generated stream needs its own decoder;
+// Tokenizer::decode() uses an internal one.
+class TokenDecoder {
+private:
+    Tokenizer *tokenizer;
+    size_t strBufferSize;
+    char *strBuffer;
+    char *utf8Buffer;
+    size_t strBufferPos;
+public:
+    TokenDecoder(Tokenizer *tokenizer);
+    ~TokenDecoder();
+    char *decode(int token);
+    void reset();
 private:
     char *detokUtf8();
 };

@@ -170,7 +170,7 @@ Tokenizer::Tokenizer(const char* tokenizerPath)
     }
     strBufferSize += 1 + 2;
     strBuffer = new char[strBufferSize];
-    utf8Buffer = new char[strBufferSize];
+    decoder = new TokenDecoder(this);
 
     fclose(file);
 }
@@ -185,7 +185,7 @@ Tokenizer::~Tokenizer() {
     delete[] vocabScores;
     delete[] specialVocab;
     delete[] strBuffer;
-    delete[] utf8Buffer;
+    delete decoder;
 }
 
 void Tokenizer::printHeader() {
@@ -237,10 +237,31 @@ bool Tokenizer::isEos(int token) {
 }
 
 void Tokenizer::resetDecoder() {
+    decoder->reset();
+}
+
+char *Tokenizer::decode(int token) {
+    return decoder->decode(token);
+}
+
+TokenDecoder::TokenDecoder(Tokenizer *tokenizer) {
+    this->tokenizer = tokenizer;
+    strBufferSize = tokenizer->strBufferSize;
+    strBuffer = new char[strBufferSize];
+    utf8Buffer = new char[strBufferSize];
     strBufferPos = 0;
 }
 
-char *Tokenizer::detokUtf8() {
+TokenDecoder::~TokenDecoder() {
+    delete[] strBuffer;
+    delete[] utf8Buffer;
+}
+
+void TokenDecoder::reset() {
+    strBufferPos = 0;
+}
+
+char *TokenDecoder::detokUtf8() {
     char* src = strBuffer;
     char* dst = utf8Buffer;
     char* checkpoint_src = src;
@@ -307,17 +328,17 @@ char *Tokenizer::detokUtf8() {
     }
 }
 
-char *Tokenizer::decode(int token) {
-    if (token == bosId)
+char *TokenDecoder::decode(int token) {
+    if (token == tokenizer->bosId)
         return nullptr;
-    if (isEos(token)) {
+    if (tokenizer->isEos(token)) {
         if (strBufferPos > 0)
             return strBuffer;
         return nullptr;
     }
 
-    char *piece = vocab[token];
-    int pieceLen = vocabLength[token];
+    char *piece = tokenizer->vocab[token];
+    int pieceLen = tokenizer->vocabLength[token];
 
     assert(strBufferPos + pieceLen + 1 < strBufferSize);
     std::memcpy(&strBuffer[strBufferPos], piece, pieceLen * sizeof(char));
