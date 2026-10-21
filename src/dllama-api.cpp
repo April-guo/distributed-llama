@@ -11,6 +11,11 @@
 #include <csignal>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -26,6 +31,7 @@
 #include "json.hpp"
 #include "api-types.hpp"
 #include "nn/nn-network.hpp"
+#include "scheduler.hpp"
 
 typedef unsigned int pos_t;
 
@@ -252,29 +258,6 @@ public:
     }
 };
 
-struct Route {
-    std::string path;
-    HttpMethod method;
-    std::function<void(HttpRequest&)> handler;
-};
-
-class Router {
-public:
-    static void resolve(HttpRequest& request, std::vector<Route>& routes) {
-        if (request.method == HttpMethod::METHOD_OPTIONS) {
-            request.writeCors();
-            return;
-        }
-        for (const auto& route : routes) {
-            if (request.method == route.method && request.path == route.path) {
-                route.handler(request);
-                return;
-            }
-        }
-        request.writeNotFound();
-    }
-};
-
 void writeChatCompletionChunk(HttpRequest &request, const std::string &delta, const bool stop){
     ChunkChoice choice;
     if (stop) {
@@ -359,232 +342,9 @@ static std::string tryBuildToolsSystemPrompt(const std::vector<Tool> &tools, con
     return prompt;
 }
 
-class NaiveCacheItem {
-public:
-    pos_t endPos;
-    ChatMessage message;
-    NaiveCacheItem(pos_t endPos, ChatMessage message) {
-        this->endPos = endPos;
-        this->message = message;
-    }
-};
-
-class NaiveCache {
-private:
-    std::vector<NaiveCacheItem> cache;
-public:
-    void push(NaiveCacheItem item) {
-        cache.push_back(item);
-    }
-
-    void clear() {
-        cache.clear();
-    }
-
-    bool resolveDeltaPrompt(std::vector<ChatMessage>& messages, pos_t& startPos) {
-        size_t cacheSize = cache.size();
-        if (cacheSize == 0)
-            return false;
-        if (messages.size() > cacheSize) {
-            size_t i = 0;
-            while (i < cacheSize) {
-                if (
-                    cache[i].message.role != messages[i].role ||
-                    cache[i].message.content != messages[i].content
-                ) break;
-                i++;
-            }
-            if (i == cacheSize) {
-                startPos = cache[i - 1].endPos;
-                messages.erase(messages.begin(), messages.begin() + i);
-                printf("🐤 Found naive cache for %zu messages, pos=%d\n", i, startPos);
-                return true;
-            }
-        }
-        cache.clear();
-        return false;
-    }
-};
-
-class ApiServer {
-private:
-    RootLlmInference *inference;
-    Tokenizer *tokenizer;
-    Sampler *sampler;
-    AppCliArgs *args;
-    LlmHeader *header;
-    EosDetector *eosDetector;
-    ChatTemplateGenerator *templateGenerator;
-    NaiveCache naiveCache;
-
-public:
-    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, Sampler *sampler, AppCliArgs *args, LlmHeader *header, EosDetector *eosDetector, ChatTemplateGenerator *templateGenerator) {
-        this->inference = inference;
-        this->tokenizer = tokenizer;
-        this->sampler = sampler;
-        this->args = args;
-        this->header = header;
-        this->eosDetector = eosDetector;
-        this->templateGenerator = templateGenerator;
-    }
-
-    void complete(HttpRequest& request) {
-        InferenceParams params = parseRequest(request);
-
-        pos_t startPos = 0;
-        std::vector<ChatMessage> deltaPrompt = params.messages;
-        naiveCache.resolveDeltaPrompt(deltaPrompt, startPos);
-
-        size_t nInputItems = deltaPrompt.size();
-        std::unique_ptr<ChatItem[]> inputItemsPtr(new ChatItem[nInputItems]);
-        ChatItem *inputItems = inputItemsPtr.get();
-        for (size_t i = 0; i < nInputItems; i++) {
-            inputItems[i].role = deltaPrompt[i].role;
-            inputItems[i].message = deltaPrompt[i].content;
-        }
-
-        GeneratedChat inputPrompt = templateGenerator->generate(nInputItems, inputItems, true);
-        printf("🔹\033[34m%s", inputPrompt.content);
-        fflush(stdout);
-
-        int nPromptTokens;
-        std::unique_ptr<int[]> promptTokensPtr(new int[inputPrompt.length + 2]);
-        int *promptTokens = promptTokensPtr.get();
-        bool isStart = startPos == 0;
-        tokenizer->encode((char*)inputPrompt.content, promptTokens, &nPromptTokens, isStart, true);
-
-        pos_t promptEndPos = startPos + nPromptTokens - 1;
-        if (promptEndPos > header->seqLen)
-            promptEndPos = header->seqLen;
-
-        pos_t maxPredPos = params.max_tokens > 0 ? (promptEndPos + params.max_tokens) : header->seqLen;
-        if (maxPredPos > header->seqLen)
-            maxPredPos = header->seqLen;
-
-        for (size_t j = 0; j < deltaPrompt.size(); j++) {
-            naiveCache.push(NaiveCacheItem(promptEndPos, deltaPrompt[j]));
-        }
-
-        std::string buffer;
-
-        if (params.stream)
-            request.writeStreamStartChunk();
-        if (inputPrompt.publicPrompt != nullptr) {
-            if (params.stream)
-                writeChatCompletionChunk(request, inputPrompt.publicPrompt, false);
-            buffer += inputPrompt.publicPrompt;
-        }
-
-        printf("(%d tokens)\033\n[0m🔸", promptEndPos - startPos);
-        fflush(stdout);
-
-        NnUint pos = startPos;
-        int token = promptTokens[0];
-        for (NnUint i = 0; ;) {
-            long remainingTokens = promptEndPos - pos;
-            if (remainingTokens <= 0)
-                break;
-
-            NnUint batchSize = remainingTokens < args->nBatches
-                ? remainingTokens
-                : args->nBatches;
-
-            inference->setBatchSize(batchSize);
-            inference->setPosition(pos);
-            for (NnUint j = 0; j < batchSize; j++)
-                inference->setToken(j, promptTokens[i + j]);
-
-            inference->forward();
-
-            i += batchSize;
-            pos += batchSize;
-            token = promptTokens[i];
-        }
-
-        inference->setBatchSize(1);
-        tokenizer->resetDecoder();
-        eosDetector->reset();
-
-        for (; pos < maxPredPos;) {
-            inference->setPosition(pos);
-            inference->setToken(0, token);
-            inference->forward();
-
-            token = sampler->sample(inference->logitsPipe);
-
-            char *piece = tokenizer->decode(token);
-            EosDetectorType eosType = eosDetector->append(token, piece);
-
-            if (piece != nullptr) {
-                printf("%s", piece);
-                fflush(stdout);
-            }
-
-            if (eosType == NOT_EOS || eosType == EOS) {
-                char *delta = eosDetector->getDelta();
-                if (delta != nullptr) {
-                    std::string deltaStr(delta);
-                    if (params.stream)
-                        writeChatCompletionChunk(request, deltaStr, false);
-                    buffer += deltaStr;
-                }
-                eosDetector->reset();
-            }
-            pos++;
-            if (eosType == EOS) break;
-        }
-
-        ChatMessage reply("assistant", buffer);
-        if (pos == header->seqLen) {
-            naiveCache.clear();
-        } else {
-            naiveCache.push(NaiveCacheItem(pos, reply));
-        }
-
-        if (params.stream) {
-            writeChatCompletionChunk(request, "", true);
-        } else {
-            Choice choice(reply);
-
-            if (!params.tools.empty()) {
-                std::vector<ToolCall> parsedToolCalls;
-                json tempJson;
-                if (tryFindJsonFragmentAtEnd(buffer, tempJson) &&
-                    tryParseToolCallsFromJson(tempJson, parsedToolCalls)) {
-                    choice.message.tool_calls = parsedToolCalls;
-                    choice.finish_reason = "tool_calls";
-                }
-            }
-
-            int nCompletionTokens = pos - promptEndPos;
-            ChatUsage usage(nPromptTokens, nCompletionTokens, nPromptTokens + nCompletionTokens);
-            ChatCompletion completion(choice, usage);
-            std::string chatJson = ((json)completion).dump();
-            request.writeJson(chatJson);
-        }
-        printf("🔶\n");
-        fflush(stdout);
-    }
-
-private:
-    InferenceParams parseRequest(HttpRequest& request) {
-        InferenceParams params = parseInferenceParams(
-            request.parsedJson,
-            args->temperature,
-            args->topp,
-            args->seed);
-        sampler->setSeed(params.seed);
-        if (!params.tools.empty()) {
-            std::string prompt = tryBuildToolsSystemPrompt(params.tools, params.tool_choice);
-            ChatMessage toolMessage("system", prompt);
-            params.messages.insert(params.messages.begin(), toolMessage);
-        }
-        return params;
-    }
-};
-
-void handleCompletionsRequest(HttpRequest& request, ApiServer *api) {
-    api->complete(request);
+static uint64_t nowNs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 void handleModelsRequest(HttpRequest& request, const char* modelPath) {
@@ -598,42 +358,447 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
     request.writeJson(response);
 }
 
+// A chat completion read by the HTTP thread, waiting for a KV-cache slot
+struct PendingCompletion {
+    std::unique_ptr<NnSocket> socket;
+    HttpRequest request;
+    uint64_t arrivalNs;
+
+    PendingCompletion(NnSocket *socket, const HttpRequest &request, uint64_t arrivalNs)
+        : socket(socket), request(request), arrivalNs(arrivalNs) {}
+};
+
+class PendingQueue {
+private:
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::deque<std::unique_ptr<PendingCompletion>> items;
+
+public:
+    void push(std::unique_ptr<PendingCompletion> item) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            items.push_back(std::move(item));
+        }
+        condition.notify_one();
+    }
+
+    // Returns nullptr if the queue is empty and wait is false
+    std::unique_ptr<PendingCompletion> pop(bool wait) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (wait)
+            condition.wait(lock, [this] { return !items.empty(); });
+        if (items.empty())
+            return nullptr;
+        std::unique_ptr<PendingCompletion> item = std::move(items.front());
+        items.pop_front();
+        return item;
+    }
+};
+
+// An admitted request: it owns a KV-cache slot and its own sampling and streaming state
+struct ApiRequest : SchedRequest {
+    std::unique_ptr<NnSocket> socket;
+    HttpRequest http;
+    InferenceParams params;
+    NnUint slot;
+    std::vector<int> promptTokens;
+    int nPromptTokens;
+    pos_t pos; // tokens already in the slot's KV cache
+    pos_t promptEndPos;
+    pos_t maxPredPos;
+    int token; // the next decode input
+    std::unique_ptr<Sampler> sampler;
+    std::unique_ptr<EosDetector> eosDetector;
+    std::unique_ptr<TokenDecoder> decoder;
+    std::string buffer;
+    uint64_t arrivalNs;
+    bool hasFirstToken;
+    bool failed;
+    bool finished;
+
+    ApiRequest(const HttpRequest &http) : http(http) {}
+};
+
+// Runs every forward of the root node. Before each forward the scheduling policy picks which
+// admitted requests contribute rows; rows of one batch may belong to different requests.
+class ApiServer {
+private:
+    RootLlmInference *inference;
+    Tokenizer *tokenizer;
+    AppCliArgs *args;
+    LlmHeader *header;
+    TokenizerChatStops *stops;
+    ChatTemplateGenerator *templateGenerator;
+    PendingQueue *pending;
+    std::unique_ptr<SchedPolicy> policy;
+    std::vector<bool> isSlotUsed;
+    std::vector<std::unique_ptr<ApiRequest>> active; // in admission order
+    NnUint nextRequestId;
+    NnUint step;
+    FILE *schedLog;
+
+public:
+    ApiServer(RootLlmInference *inference, Tokenizer *tokenizer, AppCliArgs *args, LlmHeader *header,
+        TokenizerChatStops *stops, ChatTemplateGenerator *templateGenerator, PendingQueue *pending) {
+        this->inference = inference;
+        this->tokenizer = tokenizer;
+        this->args = args;
+        this->header = header;
+        this->stops = stops;
+        this->templateGenerator = templateGenerator;
+        this->pending = pending;
+        this->policy.reset(createSchedPolicy(args->policy, args->rrQuantum));
+        this->isSlotUsed.assign(args->maxSlots, false);
+        this->nextRequestId = 0;
+        this->step = 0;
+        this->schedLog = nullptr;
+        if (args->schedLogPath != nullptr) {
+            schedLog = fopen(args->schedLogPath, "w");
+            if (schedLog == nullptr)
+                throw std::runtime_error("Cannot open the scheduler log: " + std::string(args->schedLogPath));
+            fprintf(schedLog, "# policy=%s rr_quantum=%u max_slots=%u n_batches=%u seq_len=%u clock=steady_ns\n",
+                policy->name(), args->rrQuantum, args->maxSlots, args->nBatches, header->seqLen);
+            fprintf(schedLog, "# forward,<step>,<t_start>,<t_end>,<batch_size>,<request>:<p|d>:<rows>;...\n");
+            fprintf(schedLog, "# request,<id>,<arrive|admit|first_token|finish>,<t>,<detail>\n");
+            fflush(schedLog);
+        }
+        printf("🗓️ Scheduler: %s (rr quantum %u), %u KV-cache slots\n", policy->name(), args->rrQuantum, args->maxSlots);
+        if (strcmp(policy->name(), "serial") != 0 && args->maxSlots < 2)
+            printf("⚠️ With 1 KV-cache slot only one request is served at a time, use --max-slots 2 or more\n");
+    }
+
+    ~ApiServer() {
+        if (schedLog != nullptr)
+            fclose(schedLog);
+    }
+
+    void run() {
+        std::vector<SchedRequest *> view;
+        std::vector<SchedItem> items;
+        while (true) {
+            if (active.empty()) {
+                admit(pending->pop(true));
+            }
+            while (hasFreeSlot()) {
+                std::unique_ptr<PendingCompletion> next = pending->pop(false);
+                if (!next)
+                    break;
+                admit(std::move(next));
+            }
+            removeFinished();
+            if (active.empty())
+                continue;
+
+            view.clear();
+            for (size_t i = 0; i < active.size(); i++)
+                view.push_back(active[i].get());
+            items.clear();
+            policy->pick(view, args->nBatches, items);
+            forward(items);
+            removeFinished();
+        }
+    }
+
+private:
+    bool hasFreeSlot() {
+        return std::find(isSlotUsed.begin(), isSlotUsed.end(), false) != isSlotUsed.end();
+    }
+
+    void admit(std::unique_ptr<PendingCompletion> next) {
+        std::unique_ptr<ApiRequest> request(new ApiRequest(next->request));
+        ApiRequest *r = request.get();
+        r->socket = std::move(next->socket);
+        r->id = nextRequestId++;
+        r->arrivalNs = next->arrivalNs;
+        r->hasFirstToken = false;
+        r->failed = false;
+        r->finished = false;
+        logRequest(r, "arrive", r->arrivalNs, "");
+
+        try {
+            r->params = parseRequest(r->http);
+
+            size_t nInputItems = r->params.messages.size();
+            std::unique_ptr<ChatItem[]> inputItemsPtr(new ChatItem[nInputItems]);
+            ChatItem *inputItems = inputItemsPtr.get();
+            for (size_t i = 0; i < nInputItems; i++) {
+                inputItems[i].role = r->params.messages[i].role;
+                inputItems[i].message = r->params.messages[i].content;
+            }
+
+            GeneratedChat inputPrompt = templateGenerator->generate(nInputItems, inputItems, true);
+            printf("🔹\033[34m%s", inputPrompt.content);
+            fflush(stdout);
+
+            r->promptTokens.resize(inputPrompt.length + 2);
+            tokenizer->encode((char*)inputPrompt.content, r->promptTokens.data(), &r->nPromptTokens, true, true);
+
+            r->promptEndPos = r->nPromptTokens - 1;
+            if (r->promptEndPos > header->seqLen)
+                r->promptEndPos = header->seqLen;
+            r->maxPredPos = r->params.max_tokens > 0 ? (r->promptEndPos + r->params.max_tokens) : header->seqLen;
+            if (r->maxPredPos > header->seqLen)
+                r->maxPredPos = header->seqLen;
+
+            // Prefill writes all prompt tokens but the last one, which is the first decode input
+            r->pos = 0;
+            r->token = r->promptTokens[0];
+            r->nPrefillLeft = r->promptEndPos;
+            r->phase = r->nPrefillLeft > 0 ? SCHED_PREFILL : SCHED_DECODE;
+
+            r->sampler.reset(new Sampler(tokenizer->vocabSize, args->temperature, args->topp, r->params.seed));
+            r->eosDetector.reset(new EosDetector(stops->nStops, tokenizer->eosTokenIds.data(), stops->stops, stops->maxStopLength, stops->maxStopLength));
+            r->decoder.reset(new TokenDecoder(tokenizer));
+
+            if (r->params.stream)
+                r->http.writeStreamStartChunk();
+            if (inputPrompt.publicPrompt != nullptr) {
+                if (r->params.stream)
+                    writeChatCompletionChunk(r->http, inputPrompt.publicPrompt, false);
+                r->buffer += inputPrompt.publicPrompt;
+            }
+            printf("(%d tokens)\033\n[0m🔸", r->promptEndPos);
+            fflush(stdout);
+        } catch (const std::exception &e) {
+            printf("🚨 Request %u rejected: %s\n", r->id, e.what());
+            logRequest(r, "finish", nowNs(), "n_out=0;reason=error");
+            return; // closes the socket
+        }
+
+        r->slot = (NnUint)(std::find(isSlotUsed.begin(), isSlotUsed.end(), false) - isSlotUsed.begin());
+        assert(r->slot < isSlotUsed.size());
+        isSlotUsed[r->slot] = true;
+        char detail[128];
+        snprintf(detail, sizeof(detail), "slot=%u;prompt_tokens=%d;max_pred_pos=%u", r->slot, r->nPromptTokens, r->maxPredPos);
+        logRequest(r, "admit", nowNs(), detail);
+        active.push_back(std::move(request));
+
+        if (r->phase == SCHED_DECODE && r->pos >= r->maxPredPos)
+            finish(r, "max");
+    }
+
+    void forward(const std::vector<SchedItem> &items) {
+        std::vector<NnUint> firstRows(items.size());
+        NnUint nRows = 0;
+        for (size_t i = 0; i < items.size(); i++) {
+            firstRows[i] = nRows;
+            nRows += items[i].nTokens;
+        }
+        assert(nRows > 0 && nRows <= args->nBatches);
+
+        inference->setBatchSize(nRows);
+        for (size_t i = 0; i < items.size(); i++) {
+            ApiRequest *r = static_cast<ApiRequest *>(items[i].request);
+            const NnUint slotStart = r->slot * header->seqLen;
+            for (NnUint j = 0; j < items[i].nTokens; j++) {
+                const NnUint row = firstRows[i] + j;
+                inference->setRowPosition(row, slotStart + r->pos + j);
+                inference->setToken(row, r->phase == SCHED_PREFILL ? r->promptTokens[r->pos + j] : r->token);
+            }
+        }
+
+        const uint64_t tStart = nowNs();
+        inference->forward();
+        const uint64_t tEnd = nowNs();
+        logForward(items, nRows, tStart, tEnd);
+        step++;
+
+        for (size_t i = 0; i < items.size(); i++) {
+            ApiRequest *r = static_cast<ApiRequest *>(items[i].request);
+            if (r->phase == SCHED_PREFILL)
+                advancePrefill(r, items[i].nTokens);
+            else
+                decode(r, firstRows[i]);
+        }
+    }
+
+    void advancePrefill(ApiRequest *r, NnUint nTokens) {
+        r->pos += nTokens;
+        r->nPrefillLeft -= nTokens;
+        if (r->nPrefillLeft > 0)
+            return;
+        r->phase = SCHED_DECODE;
+        r->token = r->promptTokens[r->pos];
+        if (r->pos >= r->maxPredPos)
+            finish(r, "max");
+    }
+
+    void decode(ApiRequest *r, NnUint row) {
+        r->token = r->sampler->sample(inference->logitsPipe + (NnSize)row * header->vocabSize);
+
+        char *piece = r->decoder->decode(r->token);
+        EosDetectorType eosType = r->eosDetector->append(r->token, piece);
+
+        if (piece != nullptr) {
+            printf("%s", piece);
+            fflush(stdout);
+        }
+
+        if (eosType == NOT_EOS || eosType == EOS) {
+            char *delta = r->eosDetector->getDelta();
+            if (delta != nullptr) {
+                std::string deltaStr(delta);
+                if (r->params.stream)
+                    writeChunk(r, deltaStr, false);
+                r->buffer += deltaStr;
+            }
+            r->eosDetector->reset();
+        }
+        r->pos++;
+        if (!r->hasFirstToken) {
+            r->hasFirstToken = true;
+            logRequest(r, "first_token", nowNs(), "");
+        }
+
+        if (r->failed)
+            finish(r, "error");
+        else if (eosType == EOS)
+            finish(r, "eos");
+        else if (r->pos >= r->maxPredPos)
+            finish(r, "max");
+    }
+
+    void writeChunk(ApiRequest *r, const std::string &delta, bool stop) {
+        if (r->failed)
+            return;
+        try {
+            writeChatCompletionChunk(r->http, delta, stop);
+        } catch (const NnTransferSocketException &e) {
+            printf("🚨 Request %u: %s\n", r->id, e.what());
+            r->failed = true;
+        }
+    }
+
+    void finish(ApiRequest *r, const char *reason) {
+        ChatMessage reply("assistant", r->buffer);
+        if (r->params.stream) {
+            writeChunk(r, "", true);
+        } else if (!r->failed) {
+            Choice choice(reply);
+
+            if (!r->params.tools.empty()) {
+                std::vector<ToolCall> parsedToolCalls;
+                json tempJson;
+                if (tryFindJsonFragmentAtEnd(r->buffer, tempJson) &&
+                    tryParseToolCallsFromJson(tempJson, parsedToolCalls)) {
+                    choice.message.tool_calls = parsedToolCalls;
+                    choice.finish_reason = "tool_calls";
+                }
+            }
+
+            int nCompletionTokens = r->pos - r->promptEndPos;
+            ChatUsage usage(r->nPromptTokens, nCompletionTokens, r->nPromptTokens + nCompletionTokens);
+            ChatCompletion completion(choice, usage);
+            std::string chatJson = ((json)completion).dump();
+            try {
+                r->http.writeJson(chatJson);
+            } catch (const NnTransferSocketException &e) {
+                printf("🚨 Request %u: %s\n", r->id, e.what());
+            }
+        }
+        printf("🔶\n");
+        fflush(stdout);
+
+        char detail[96];
+        snprintf(detail, sizeof(detail), "n_out=%u;reason=%s", r->pos - r->promptEndPos, reason);
+        logRequest(r, "finish", nowNs(), detail);
+        r->finished = true;
+    }
+
+    void removeFinished() {
+        for (size_t i = 0; i < active.size();) {
+            if (active[i]->finished) {
+                policy->onRemove(i);
+                isSlotUsed[active[i]->slot] = false;
+                active.erase(active.begin() + i);
+            } else {
+                i++;
+            }
+        }
+    }
+
+    void logRequest(ApiRequest *r, const char *event, uint64_t t, const char *detail) {
+        if (schedLog == nullptr)
+            return;
+        fprintf(schedLog, "request,%u,%s,%llu,%s\n", r->id, event, (unsigned long long)t, detail);
+        fflush(schedLog);
+    }
+
+    void logForward(const std::vector<SchedItem> &items, NnUint nRows, uint64_t tStart, uint64_t tEnd) {
+        if (schedLog == nullptr)
+            return;
+        fprintf(schedLog, "forward,%u,%llu,%llu,%u,", step, (unsigned long long)tStart, (unsigned long long)tEnd, nRows);
+        for (size_t i = 0; i < items.size(); i++)
+            fprintf(schedLog, "%s%u:%c:%u", i == 0 ? "" : ";", items[i].request->id,
+                items[i].request->phase == SCHED_PREFILL ? 'p' : 'd', items[i].nTokens);
+        fprintf(schedLog, "\n");
+        fflush(schedLog);
+    }
+
+    InferenceParams parseRequest(HttpRequest& request) {
+        InferenceParams params = parseInferenceParams(
+            request.parsedJson,
+            args->temperature,
+            args->topp,
+            args->seed);
+        if (!params.tools.empty()) {
+            std::string prompt = tryBuildToolsSystemPrompt(params.tools, params.tool_choice);
+            ChatMessage toolMessage("system", prompt);
+            params.messages.insert(params.messages.begin(), toolMessage);
+        }
+        return params;
+    }
+};
+
+// Reads HTTP requests and hands chat completions to the scheduler, so requests are accepted
+// while others are being generated
+static void acceptLoop(int serverSocket, PendingQueue *pending, const char *modelPath, std::atomic<bool> *isStopping) {
+    while (!isStopping->load()) {
+        try {
+            std::unique_ptr<NnSocket> clientSocket(new NnSocket(acceptSocket(serverSocket)));
+            HttpRequest request = HttpRequest::read(clientSocket->fd);
+            const uint64_t arrivalNs = nowNs();
+            printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
+
+            if (request.method == HttpMethod::METHOD_OPTIONS) {
+                request.writeCors();
+            } else if (request.method == HttpMethod::METHOD_POST && request.path == "/v1/chat/completions") {
+                pending->push(std::unique_ptr<PendingCompletion>(
+                    new PendingCompletion(clientSocket.release(), request, arrivalNs)));
+            } else if (request.method == HttpMethod::METHOD_GET && request.path == "/v1/models") {
+                handleModelsRequest(request, modelPath);
+            } else {
+                request.writeNotFound();
+            }
+        } catch (const std::exception &e) {
+            if (!isStopping->load())
+                printf("Socket error: %s\n", e.what());
+        }
+    }
+}
+
 static void server(AppInferenceContext *context) {
     NnSocket serverSocket(createServerSocket(context->args->host, context->args->port));
 
     TokenizerChatStops stops(context->tokenizer);
     ChatTemplateGenerator templateGenerator(context->args->chatTemplateType, context->tokenizer->chatTemplate, stops.stops[0]);
-    EosDetector eosDetector(stops.nStops, context->tokenizer->eosTokenIds.data(), stops.stops, stops.maxStopLength, stops.maxStopLength);
-    ApiServer api(context->inference, context->tokenizer, context->sampler, context->args, context->header, &eosDetector, &templateGenerator);
+    PendingQueue pending;
+    ApiServer api(context->inference, context->tokenizer, context->args, context->header, &stops, &templateGenerator, &pending);
 
     if (strcmp(context->args->host, "0.0.0.0") == 0 ||
         strcmp(context->args->host, "127.0.0.1") == 0)
         printf("Server URL: http://localhost:%d/v1/\n", context->args->port);
 
-    std::vector<Route> routes = {
-        {
-            "/v1/chat/completions",
-            HttpMethod::METHOD_POST,
-            std::bind(&handleCompletionsRequest, std::placeholders::_1, &api)
-        },
-        {
-            "/v1/models",
-            HttpMethod::METHOD_GET,
-            std::bind(&handleModelsRequest, std::placeholders::_1, context->args->modelPath)
-        }
-    };
-
-    while (true) {
-        try {
-            NnSocket clientSocket(acceptSocket(serverSocket.fd));
-            HttpRequest request = HttpRequest::read(clientSocket.fd);
-            printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
-            Router::resolve(request, routes);
-        } catch (const NnTransferSocketException& e) {
-            printf("Socket error: %d %s\n", e.code, e.what());
-        } catch (const NnExecutorException &e) {
-            throw;
-        }
+    std::atomic<bool> isStopping(false);
+    std::thread acceptor(acceptLoop, serverSocket.fd, &pending, context->args->modelPath, &isStopping);
+    try {
+        api.run();
+    } catch (...) {
+        isStopping.store(true);
+        shutdown(serverSocket.fd, 2); // unblocks accept()
+        acceptor.join();
+        throw;
     }
 }
 
@@ -653,6 +818,9 @@ void usage() {
     fprintf(stderr, "        [--temperature <temp>]\n");
     fprintf(stderr, "        [--topp <t>]\n");
     fprintf(stderr, "        [--seed <s>]\n");
+    fprintf(stderr, "        [--max-slots <n>] (KV-cache slots = requests served at once, default 1)\n");
+    fprintf(stderr, "        [--policy {serial|rr|concurrent}] [--rr-quantum <forwards>]\n");
+    fprintf(stderr, "        [--sched-log <csv path>]\n");
     fprintf(stderr, "Example:\n");
     fprintf(stderr, "  sudo nice -n -20 ./dllama-api --port 9990 --nthreads 4 \\\n");
     fprintf(stderr, "    --model dllama_model_llama3_2_3b_instruct_q40.m \\\n");
