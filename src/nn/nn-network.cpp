@@ -331,18 +331,28 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
     // We need to wait here until the root node will send a "root is ready" packet
     readAckPacket(rootSocketFd);
 
+    // Socket i + 1 is worker i if i < nodeIndex, otherwise worker i + 1. This worker connects to
+    // the workers after it and accepts the ones before it. Those arrive in any order, so every
+    // connecting worker sends its index and the accepted socket goes to that worker's place.
     for (NnUint i = 0; i < nNodes; i++) {
         char *host = hosts[i].get();
         int port = ports[i];
         NnUint socketIndex = i + 1;
         if (i >= nodeIndex) {
             printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(connectSocket(host, port));
+            int fd = connectSocket(host, port);
+            sockets[socketIndex].assign(fd);
+            writeSocket(fd, &nodeIndex, sizeof(nodeIndex));
             printf("⭕ Socket[%d]: connected\n", socketIndex);
         } else {
-            printf("⭕ Socket[%d]: wait for %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(acceptSocket(socketSocket.fd));
-            printf("⭕ Socket[%d]: accepted\n", socketIndex);
+            printf("⭕ Socket[%d]: wait for a worker\n", socketIndex);
+            NnSocket peerSocket(acceptSocket(socketSocket.fd));
+            NnUint peerIndex;
+            readSocket(peerSocket.fd, &peerIndex, sizeof(peerIndex));
+            if (peerIndex >= nodeIndex || sockets[peerIndex + 1].fd >= 0)
+                throw std::runtime_error("Unexpected worker index: " + std::to_string(peerIndex));
+            sockets[peerIndex + 1].assign(peerSocket.release());
+            printf("⭕ Socket[%d]: accepted %s:%d worker\n", peerIndex + 1, hosts[peerIndex].get(), ports[peerIndex]);
         }
     }
 
