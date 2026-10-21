@@ -5,7 +5,11 @@
 #include "mmap.hpp"
 #include "llm.hpp"
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <string>
 
 static const char *hiddenActToString(LlmHiddenAct act) {
     if (act == HIDDEN_ACT_GELU) return "Gelu";
@@ -148,9 +152,18 @@ void printLlmHeader(LlmHeader *header) {
     }
 }
 
-LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) {
-    NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
-    NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
+// What one node config holds
+typedef struct {
+    NnUint sliceIndex; // tensor parallelism: the node runs slice `sliceIndex` of every matrix
+    NnUint nSlices;
+    bool hasEmbedding;
+    NnUint layerStart;
+    NnUint layerEnd;
+    bool hasLogits; // the final norm and the logits; a pipeline stage without them hands X on
+    bool hasSyncs; // tensor parallelism exchanges slices inside the executor
+} LlmNodePart;
+
+static LlmNet createLlmNet(LlmHeader *h, NnUint nSlices, NnUint nBatches, NnUint nSlots, NnUint *zqPipeIndex) {
     NnUint ffDim = h->hiddenDim;
 
     if (h->archType == QWEN3_MOE)
@@ -162,48 +175,77 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
 
-    NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes, nSlots);
-    NnMultiHeadAttSlice multiHeadAttSlice = sliceMultiHeadAtt(h->nHeads, h->seqLen, nNodes, nBatches);
+    n.qSlice = sliceRowMatmul(h->weightType, nSlices, h->dim, h->qDim);
+    n.kSlice = sliceRowMatmul(h->weightType, nSlices, h->dim, h->kvDim);
+    n.vSlice = sliceRowMatmul(h->weightType, nSlices, h->dim, h->kvDim);
+    n.woSlice = sliceColMatmul(h->weightType, nSlices, h->qDim, h->dim);
 
-    n.qSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->qDim);
-    n.kSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->kvDim);
-    n.vSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->kvDim);
-    n.woSlice = sliceColMatmul(h->weightType, nNodes, h->qDim, h->dim);
+    n.w1Slice = sliceRowMatmul(h->weightType, nSlices, h->dim, ffDim);
+    n.w2Slice = sliceColMatmul(h->weightType, nSlices, ffDim, h->dim);
+    n.w3Slice = sliceRowMatmul(h->weightType, nSlices, h->dim, ffDim);
+    n.wclsSlice = sliceRowMatmul(h->weightType, nSlices, h->dim, h->vocabSize);
 
-    n.w1Slice = sliceRowMatmul(h->weightType, nNodes, h->dim, ffDim);
-    n.w2Slice = sliceColMatmul(h->weightType, nNodes, ffDim, h->dim);
-    n.w3Slice = sliceRowMatmul(h->weightType, nNodes, h->dim, ffDim);
-    n.wclsSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->vocabSize);
- 
-    NnUint nQNormColumns = 1;
-    NnUint nKNormColumns = 1;
-    NnUint nInvBufferColumns = 1;
-    if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
-        ASSERT_EQ(n.qSlice.d0 % h->headDim, 0);
-        ASSERT_EQ(n.kSlice.d0 % h->headDim, 0);
-        nQNormColumns = n.qSlice.d0 / h->headDim;
-        nKNormColumns = n.kSlice.d0 / h->headDim;
-        nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
-    }
-
-    NnNetConfigBuilder netBuilder(nNodes, nBatches);
+    NnNetConfigBuilder netBuilder(nSlices, nBatches);
 
     n.positionPipeIndex = netBuilder.addPipe("POS", size2D(F_32, nBatches, 1));
     n.tokenPipeIndex = netBuilder.addPipe("TOK", size2D(F_32, nBatches, 1));
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
-    const NnUint zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nNodes));
+    *zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nSlices));
 
     netBuilder.addPreSync(n.positionPipeIndex);
 
     n.header = h;
     n.nSlots = nSlots;
     n.netConfig = netBuilder.build();
-    n.nodeConfigs = new NnNodeConfig[nNodes];
+    n.nStages = 0;
+    n.nNodeConfigs = 0;
+    n.nodeConfigs = nullptr;
+    return n;
+}
 
-    for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+static NnNodeConfig buildLlmNodeConfig(LlmNet *net, NnUint zqPipeIndex, const LlmNodePart *part) {
+    LlmNet &n = *net;
+    LlmHeader *h = n.header;
+    const NnUint nBatches = n.netConfig.nBatches;
+    const NnUint nNodes = part->nSlices;
+    const NnUint nodeIndex = part->sliceIndex;
+    NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
+    NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
+
+    NnNodeConfigBuilder nodeBuilder(nodeIndex);
+
+    if (part->hasEmbedding || part->hasSyncs) {
+        NnSegmentConfigBuilder start;
+        if (part->hasEmbedding) {
+            start.addOp(
+                OP_EMBEDDING, "embedding", 0,
+                pointerBatchConfig(SRC_PIPE, n.tokenPipeIndex),
+                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
+                n.tokenEmbeddingSize,
+                NnEmbeddingOpConfig{});
+        }
+        if (part->hasSyncs)
+            start.addSync(n.xPipeIndex, SYNC_WITH_ROOT);
+        nodeBuilder.addSegment(start.build());
+    }
+
+    if (part->layerEnd > part->layerStart || part->hasLogits) {
+        NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes, n.nSlots);
+        NnMultiHeadAttSlice multiHeadAttSlice = sliceMultiHeadAtt(h->nHeads, h->seqLen, nNodes, nBatches);
+
+        NnUint nQNormColumns = 1;
+        NnUint nKNormColumns = 1;
+        NnUint nInvBufferColumns = 1;
+        if (h->archType == QWEN3 || h->archType == QWEN3_MOE) {
+            ASSERT_EQ(n.qSlice.d0 % h->headDim, 0);
+            ASSERT_EQ(n.kSlice.d0 % h->headDim, 0);
+            nQNormColumns = n.qSlice.d0 / h->headDim;
+            nKNormColumns = n.kSlice.d0 / h->headDim;
+            nInvBufferColumns = std::max(nQNormColumns, nKNormColumns);
+        }
+
         NnRopeSlice ropeSlice = sliceRope(h->ropeType, h->qDim, h->kvDim, h->nKvHeads, nNodes, h->seqLen, h->headDim, h->ropeTheta, nodeIndex);
-        NnNodeConfigBuilder nodeBuilder(nodeIndex);
 
         const NnUint xBufferIndex = nodeBuilder.addBuffer("x", size2D(F_32, nBatches, h->dim));
         const NnUint yBufferIndex = nodeBuilder.addBuffer("y", size2D(F_32, nBatches, h->dim));
@@ -245,19 +287,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
         const NnUint moeLBufferIndex = nodeBuilder.addBuffer("moe_l", size3D(F_32, nActiveExpertsOr1, nBatches, n.w3Slice.d0));
         const NnUint moeSBufferIndex = nodeBuilder.addBuffer("moe_s", size3D(F_32, nActiveExpertsOr1, nBatches, 1));
 
-        NnSegmentConfigBuilder start;
-        if (nodeIndex == 0) {
-            start.addOp(
-                OP_EMBEDDING, "embedding", 0,
-                pointerBatchConfig(SRC_PIPE, n.tokenPipeIndex),
-                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
-                n.tokenEmbeddingSize,
-                NnEmbeddingOpConfig{});
-        }
-        start.addSync(n.xPipeIndex, SYNC_WITH_ROOT);
-        nodeBuilder.addSegment(start.build());
-
-        for (NnUint layerIndex = 0; layerIndex < h->nLayers; layerIndex++) {
+        for (NnUint layerIndex = part->layerStart; layerIndex < part->layerEnd; layerIndex++) {
             const NnUint kBufferIndex = nodeBuilder.addBuffer("k", kvCacheSlice.keySize);
             const NnUint vBufferIndex = nodeBuilder.addBuffer("v", kvCacheSlice.valueSize);
 
@@ -265,7 +295,8 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
             NnSegmentConfigBuilder ff;
 
             // att
-            if (layerIndex == 0) {
+            if (layerIndex == part->layerStart) {
+                // The first layer of the node reads X: the embeddings or the previous stage's output
                 att.addOp(
                     OP_CAST, "block_cast_x", layerIndex,
                     pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
@@ -351,7 +382,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
                 pointerBatchConfig(SRC_BUFFER, qBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, qBufferIndex),
                 size0(),
-                NnRopeOpConfig{n.header->ropeType, 1, n.positionPipeIndex, ropeCacheBufferIndex, 
+                NnRopeOpConfig{n.header->ropeType, 1, n.positionPipeIndex, ropeCacheBufferIndex,
                     h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen,
                     ropeSlice});
             att.addOp(
@@ -359,7 +390,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
                 pointerBatchConfig(SRC_BUFFER, kTempBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, kTempBufferIndex),
                 size0(),
-                NnRopeOpConfig{n.header->ropeType, 0, n.positionPipeIndex, ropeCacheBufferIndex, 
+                NnRopeOpConfig{n.header->ropeType, 0, n.positionPipeIndex, ropeCacheBufferIndex,
                     h->ropeScalingFactor, h->ropeScalingLowFreqFactor, h->ropeScalingHighFreqFactory, h->ropeScalingOrigMaxSeqLen,
                     ropeSlice});
             att.addOp(
@@ -401,7 +432,8 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
                 pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
-            att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
+            if (part->hasSyncs)
+                att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
 
             // ff
             ff.addOp(
@@ -552,64 +584,226 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) 
                 pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
-            ff.addSync(zqPipeIndex, SYNC_NODE_SLICES);
+            if (part->hasSyncs)
+                ff.addSync(zqPipeIndex, SYNC_NODE_SLICES);
 
             nodeBuilder.addSegment(att.build());
             nodeBuilder.addSegment(ff.build());
         }
 
-        NnSegmentConfigBuilder end;
-        end.addOp(
-            OP_MERGE_ADD, "final_merge_add", 0,
-            pointerBatchConfig(SRC_PIPE, zqPipeIndex),
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            size0(),
-            NnMergeAddOpCodeConfig{});
-        end.addOp(
-            OP_INV_RMS, "final_norm_pre", 0,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
-            size0(),
-            NnInvRmsOpConfig{h->normEpsilon, 1});
-        end.addOp(
-            OP_RMS_NORM, "final_norm", 0,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-            n.rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
-        if (yBufferIndex != yqBufferIndex) {
+        if (part->hasLogits) {
+            NnSegmentConfigBuilder end;
             end.addOp(
-                OP_CAST, "final_cast_y", 0,
+                OP_MERGE_ADD, "final_merge_add", 0,
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(),
+                NnMergeAddOpCodeConfig{});
+            end.addOp(
+                OP_INV_RMS, "final_norm_pre", 0,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                size0(),
+                NnInvRmsOpConfig{h->normEpsilon, 1});
+            end.addOp(
+                OP_RMS_NORM, "final_norm", 0,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                n.rmsNormSize,
+                NnRmsNormOpConfig{invRmsBufferIndex, 1});
+            if (yBufferIndex != yqBufferIndex) {
+                end.addOp(
+                    OP_CAST, "final_cast_y", 0,
+                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    size0(),
+                    NnCastOpCodeConfig{});
+            }
+            end.addOp(
+                OP_MATMUL, "final_matmul_logits", 0,
                 pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+                size2D(h->weightType, n.wclsSlice.n, n.wclsSlice.d0),
+                NnMatmulOpConfig{});
+            end.addOp(
+                OP_CAST, "final_cast_logits", 0,
+                pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+                pointerBatchedSliceConfig(SRC_PIPE, n.logitsPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
-        }
-        end.addOp(
-            OP_MATMUL, "final_matmul_logits", 0,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            size2D(h->weightType, n.wclsSlice.n, n.wclsSlice.d0),
-            NnMatmulOpConfig{});
-        end.addOp(
-            OP_CAST, "final_cast_logits", 0,
-            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            pointerBatchedSliceConfig(SRC_PIPE, n.logitsPipeIndex),
-            size0(),
-            NnCastOpCodeConfig{});
-        end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
+            if (part->hasSyncs)
+                end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
 
-        nodeBuilder.addSegment(end.build());
-        n.nodeConfigs[nodeIndex] = nodeBuilder.build();
+            nodeBuilder.addSegment(end.build());
+        } else {
+            // A pipeline stage hands the residual stream on: the same merge the next layer would
+            // start with, then X goes to the next stage, whose first layer reads it back into x
+            const NnUint lastLayerIndex = part->layerEnd - 1;
+            NnSegmentConfigBuilder out;
+            out.addOp(
+                OP_MERGE_ADD, "stage_merge_add", lastLayerIndex,
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(),
+                NnMergeAddOpCodeConfig{});
+            out.addOp(
+                OP_CAST, "stage_cast_x", lastLayerIndex,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
+                size0(),
+                NnCastOpCodeConfig{});
+            nodeBuilder.addSegment(out.build());
+        }
+    }
+    return nodeBuilder.build();
+}
+
+LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) {
+    NnUint zqPipeIndex;
+    LlmNet n = createLlmNet(h, nNodes, nBatches, nSlots, &zqPipeIndex);
+    n.nNodeConfigs = nNodes;
+    n.nodeConfigs = new NnNodeConfig[nNodes];
+
+    for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+        const LlmNodePart part = {nodeIndex, nNodes, nodeIndex == 0, 0, h->nLayers, true, true};
+        n.nodeConfigs[nodeIndex] = buildLlmNodeConfig(&n, zqPipeIndex, &part);
+    }
+    return n;
+}
+
+LlmNet buildLlmPipelineNet(LlmHeader *h, NnUint nBatches, NnUint nSlots, const std::vector<NnUint> &stageEnds) {
+    const NnUint nStages = (NnUint)stageEnds.size();
+    if (nStages == 0)
+        throw std::runtime_error("A pipeline needs at least one stage");
+    for (NnUint stageIndex = 0; stageIndex < nStages; stageIndex++) {
+        if (stageEnds[stageIndex] <= llmStageStart(stageEnds, stageIndex))
+            throw std::runtime_error("Every pipeline stage needs at least one layer");
+    }
+    if (stageEnds[nStages - 1] != h->nLayers)
+        throw std::runtime_error("The pipeline stages must hold all " + std::to_string(h->nLayers) + " layers");
+
+    // Every stage runs full-width layers, so every node is slice 0 of 1: the executor and the
+    // devices see a single-node net, and the stages hand X to each other outside the executor
+    NnUint zqPipeIndex;
+    LlmNet n = createLlmNet(h, 1, nBatches, nSlots, &zqPipeIndex);
+    n.nStages = nStages;
+    n.stageEnds = stageEnds;
+    n.nNodeConfigs = nStages + 1;
+    n.nodeConfigs = new NnNodeConfig[n.nNodeConfigs];
+
+    const LlmNodePart root = {0, 1, true, 0, 0, false, false};
+    n.nodeConfigs[0] = buildLlmNodeConfig(&n, zqPipeIndex, &root);
+    for (NnUint stageIndex = 0; stageIndex < nStages; stageIndex++) {
+        const LlmNodePart stage = {0, 1, false, llmStageStart(stageEnds, stageIndex), stageEnds[stageIndex],
+            stageIndex + 1 == nStages, false};
+        n.nodeConfigs[stageIndex + 1] = buildLlmNodeConfig(&n, zqPipeIndex, &stage);
     }
     return n;
 }
 
 void releaseLlmNet(LlmNet *net) {
-    for (NnUint nodeIndex = 0u; nodeIndex < net->netConfig.nNodes; nodeIndex++)
+    for (NnUint nodeIndex = 0u; nodeIndex < net->nNodeConfigs; nodeIndex++)
         releaseNodeConfig(&net->nodeConfigs[nodeIndex]);
     releaseNetConfig(&net->netConfig);
     delete[] net->nodeConfigs;
+}
+
+std::vector<NnUint> splitLlmLayers(LlmHeader *h, NnUint nStages) {
+    const NnUint nLayers = h->nLayers;
+    if (nStages < 1 || nStages > nLayers)
+        throw std::runtime_error("The number of pipeline stages must be between 1 and " + std::to_string(nLayers));
+
+    const double ffDim = h->archType == QWEN3_MOE
+        ? (double)h->moeHiddenDim * std::max(h->nActiveExperts, 1u)
+        : (double)h->hiddenDim;
+    const double layerParams = (double)h->dim * (2.0 * h->qDim + 2.0 * h->kvDim + 3.0 * ffDim);
+    const double logitsLayers = (double)h->dim * h->vocabSize / layerParams;
+
+    // best[s][l]: the smallest maximum stage cost (in layers) when stages 0..s-1 hold layers [0, l)
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<std::vector<double>> best(nStages + 1, std::vector<double>(nLayers + 1, inf));
+    std::vector<std::vector<NnUint>> split(nStages + 1, std::vector<NnUint>(nLayers + 1, 0));
+    best[0][0] = 0.0;
+    for (NnUint s = 1; s <= nStages; s++) {
+        for (NnUint l = s; l <= nLayers; l++) {
+            for (NnUint j = s - 1; j < l; j++) {
+                if (best[s - 1][j] == inf)
+                    continue;
+                const double cost = (double)(l - j) + (s == nStages ? logitsLayers : 0.0);
+                const double m = std::max(best[s - 1][j], cost);
+                if (m < best[s][l]) {
+                    best[s][l] = m;
+                    split[s][l] = j;
+                }
+            }
+        }
+    }
+    std::vector<NnUint> stageEnds(nStages);
+    NnUint end = nLayers;
+    for (NnUint s = nStages; s >= 1; s--) {
+        stageEnds[s - 1] = end;
+        end = split[s][end];
+    }
+    return stageEnds;
+}
+
+std::vector<NnUint> parseLlmStageLayers(const char *text, LlmHeader *h, NnUint nStages) {
+    std::vector<NnUint> stageEnds;
+    NnUint end = 0;
+    const char *p = text;
+    while (*p != '\0') {
+        char *next;
+        const long nLayers = std::strtol(p, &next, 10);
+        if (next == p || nLayers <= 0)
+            throw std::runtime_error("Invalid --pp-layers value: " + std::string(text));
+        end += (NnUint)nLayers;
+        stageEnds.push_back(end);
+        p = next;
+        if (*p == ',')
+            p++;
+        else if (*p != '\0')
+            throw std::runtime_error("Invalid --pp-layers value: " + std::string(text));
+    }
+    if (stageEnds.size() != nStages)
+        throw std::runtime_error("--pp-layers must give the number of layers of each of the " + std::to_string(nStages) + " stages");
+    if (end != h->nLayers)
+        throw std::runtime_error("--pp-layers must add up to " + std::to_string(h->nLayers) + " layers");
+    return stageEnds;
+}
+
+LlmPipelineWeightLoader::LlmPipelineWeightLoader(NnExecutor *executor, NnNetwork *network, const std::vector<NnUint> &stageEnds)
+    : NnRootWeightLoader(executor, network, (NnUint)stageEnds.size() + 1)
+{
+    for (NnUint stageIndex = 0; stageIndex < stageEnds.size(); stageIndex++) {
+        for (NnUint layerIndex = llmStageStart(stageEnds, stageIndex); layerIndex < stageEnds[stageIndex]; layerIndex++)
+            layerNodes.push_back(stageIndex + 1);
+    }
+    lastNode = (NnUint)stageEnds.size();
+}
+
+NnUint LlmPipelineWeightLoader::resolveNode(const char *opName, NnUint opIndex) {
+    if (std::strncmp(opName, "final_", 6) == 0)
+        return lastNode;
+    if (opIndex >= layerNodes.size())
+        throw std::runtime_error("No pipeline stage runs layer " + std::to_string(opIndex) + " of " + std::string(opName));
+    return layerNodes[opIndex];
+}
+
+NnSize LlmPipelineWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
+    writeWeight(resolveNode(opName, opIndex), opName, opIndex, 0u, nBytes, weight);
+    return nBytes;
+}
+
+NnSize LlmPipelineWeightLoader::loadRowMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnRowMatmulSlice *slice, NnByte *weight) {
+    assert(slice->nNodes == 1u);
+    writeWeight(resolveNode(opName, opIndex), opName, opIndex, expertIndex * slice->sliceSize.nBytes, slice->sliceSize.nBytes, weight);
+    return slice->size.nBytes;
+}
+
+NnSize LlmPipelineWeightLoader::loadColMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnColMatmulSlice *slice, NnByte *weight) {
+    assert(slice->nNodes == 1u);
+    writeWeight(resolveNode(opName, opIndex), opName, opIndex, expertIndex * slice->sliceSize.nBytes, slice->sliceSize.nBytes, weight);
+    return slice->size.nBytes;
 }
 
 void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader) {

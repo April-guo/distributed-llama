@@ -481,7 +481,8 @@ NnVulkanDevice::NnVulkanDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeCo
     data(&bufferFactory, netConfig, nodeConfig),
     netConfig(netConfig),
     nodeConfig(nodeConfig),
-    netExecution(netExecution)
+    netExecution(netExecution),
+    hasSegment(false)
 {}
 
 NnVulkanDevice::~NnVulkanDevice() {}
@@ -492,7 +493,11 @@ NnUint NnVulkanDevice::maxNThreads() {
 
 NnDeviceSegment *NnVulkanDevice::createSegment(NnUint segmentIndex) {
     NnSegmentConfig *segmentConfig = &nodeConfig->segments[segmentIndex];
-    return new NnVulkanDeviceSegment(&context, &copier, &bufferFactory, &data, netConfig, segmentIndex, segmentConfig, netExecution);
+    // The executor creates and runs the segments in order, so the first one created is the first
+    // one this device runs in every forward: it uploads the pre-sync pipes (positions)
+    const bool writesPreSyncs = !hasSegment;
+    hasSegment = true;
+    return new NnVulkanDeviceSegment(&context, &copier, &bufferFactory, &data, netConfig, segmentIndex, writesPreSyncs, segmentConfig, netExecution);
 };
 
 static const char *getShaderFileName(const NnOpCode opCode, const NnOpQuantType quantType) {
@@ -833,12 +838,13 @@ NnVulkanBuffer *NnVulkanDeviceSegmentData::resolveOpWeightVulkanBuffer(NnUint op
     return data->internalBuffers[weightBufferIndex[opIndex]].get();
 }
 
-NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution) :
+NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, bool writesPreSyncs, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution) :
     context(context),
     copier(copier),
     data(data),
     netConfig(netConfig),
     segmentIndex(segmentIndex),
+    writesPreSyncs(writesPreSyncs),
     segmentConfig(segmentConfig),
     netExecution(netExecution),
     shaderModules(segmentConfig->nOps),
@@ -1043,7 +1049,7 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
 
     // TODO: refactor this block
     {
-        if (segmentIndex == 0 || segmentIndex == 1) { // TODO: this is a hack to fix workers
+        if (writesPreSyncs) {
             for (NnUint i = 0; i < netConfig->nPreSyncs; i++) {
                 NnPreSyncConfig *preSyncConfig = &netConfig->preSyncs[i];
                 NnByte *pipeData = netExecution->pipes[preSyncConfig->pipeIndex];

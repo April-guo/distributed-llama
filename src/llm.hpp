@@ -1,6 +1,7 @@
 #ifndef LLM_HPP
 #define LLM_HPP
 
+#include <vector>
 #include "nn/nn-core.hpp"
 #include "nn/nn-executor.hpp"
 #include "nn/nn-network.hpp"
@@ -76,7 +77,13 @@ typedef struct {
 typedef struct {
     LlmHeader *header;
     NnNetConfig netConfig;
+    NnUint nNodeConfigs;
     NnNodeConfig *nodeConfigs;
+    // Pipeline parallelism: 0 = off (tensor parallelism, node i runs slice i of every layer).
+    // Otherwise node 0 is the root, which only embeds tokens, and node s + 1 runs the full width
+    // of layers [stageEnds[s - 1], stageEnds[s]) (stage 0 starts at layer 0).
+    NnUint nStages;
+    std::vector<NnUint> stageEnds;
     NnRowMatmulSlice qSlice;
     NnRowMatmulSlice kSlice;
     NnRowMatmulSlice vSlice;
@@ -99,7 +106,32 @@ typedef struct {
 LlmHeader loadLlmHeader(const char* path, const unsigned int maxSeqLen, NnFloatType syncType);
 void printLlmHeader(LlmHeader *header);
 LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots = 1);
+LlmNet buildLlmPipelineNet(LlmHeader *h, NnUint nBatches, NnUint nSlots, const std::vector<NnUint> &stageEnds);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
+
+// The first layer of a pipeline stage
+static inline NnUint llmStageStart(const std::vector<NnUint> &stageEnds, NnUint stageIndex) {
+    return stageIndex == 0 ? 0 : stageEnds[stageIndex - 1];
+}
+// Splits the layers into stages with the smallest possible maximum stage cost. A layer costs its
+// parameter count; the last stage also runs the logits matmul, so it gets fewer layers.
+std::vector<NnUint> splitLlmLayers(LlmHeader *h, NnUint nStages);
+// Parses layers per stage, e.g. "17,15"
+std::vector<NnUint> parseLlmStageLayers(const char *text, LlmHeader *h, NnUint nStages);
+
+// Pipeline parallelism: every tensor goes whole to the node that runs it. The embedding stays on
+// the root, the layers go to their stages and the final norm and logits to the last stage.
+class LlmPipelineWeightLoader : public NnRootWeightLoader {
+private:
+    std::vector<NnUint> layerNodes;
+    NnUint lastNode;
+    NnUint resolveNode(const char *opName, NnUint opIndex);
+public:
+    LlmPipelineWeightLoader(NnExecutor *executor, NnNetwork *network, const std::vector<NnUint> &stageEnds);
+    NnSize loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) override;
+    NnSize loadRowMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnRowMatmulSlice *slice, NnByte *weight) override;
+    NnSize loadColMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnColMatmulSlice *slice, NnByte *weight) override;
+};
 
 #endif

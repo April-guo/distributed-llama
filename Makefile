@@ -86,6 +86,8 @@ app.o: src/app.cpp
 	$(CXX) $(CXXFLAGS) -c $^ -o $@
 tokenizer-test: src/tokenizer-test.cpp nn-quants.o nn-core.o llamafile-sgemm.o nn-cpu-ops.o tokenizer.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+llm-pp-test: src/llm-pp-test.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o llm.o
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
 dllama: src/dllama.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}

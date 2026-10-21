@@ -109,6 +109,7 @@ private:
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
     NnNetExecution *netExecution;
+    bool hasSegment;
 public:
     NnVulkanDeviceData data;
     NnVulkanDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnNetExecution *netExecution);
@@ -148,6 +149,7 @@ private:
     NnVulkanDeviceData *data;
     NnNetConfig *netConfig;
     NnUint segmentIndex;
+    bool writesPreSyncs;
     NnSegmentConfig *segmentConfig;
     NnNetExecution *netExecution;
     std::unique_ptr<NnVulkanDeviceSegmentData> segmentData;
@@ -164,7 +166,7 @@ private:
     std::vector<std::vector<NnVulkanBuffer *>> buffersToSync;
     NnUint lastBatchSize;
 public:
-    NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);
+    NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, bool writesPreSyncs, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);
     ~NnVulkanDeviceSegment() override;
     void loadWeight(NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) override;
     void forward(NnUint opIndex, NnUint nThreads, NnUint threadIndex, NnUint batchSize) override;
