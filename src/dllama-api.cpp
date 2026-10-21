@@ -405,6 +405,9 @@ struct ApiRequest : SchedRequest {
     std::vector<int> promptTokens;
     int nPromptTokens;
     pos_t pos; // tokens already in the slot's KV cache
+    pos_t schedPos; // tokens sent to forwards, pos plus the ones in flight
+    NnUint nInFlight; // microbatches in flight with rows of this request
+    bool decodeInFlight;
     pos_t promptEndPos;
     pos_t maxPredPos;
     int token; // the next decode input
@@ -420,8 +423,27 @@ struct ApiRequest : SchedRequest {
     ApiRequest(const HttpRequest &http) : http(http) {}
 };
 
+// One forward in flight: which rows belong to which request
+struct InFlightItem {
+    ApiRequest *request;
+    NnUint nTokens;
+    NnUint firstRow;
+    bool isPrefill;
+};
+
+struct Microbatch {
+    NnUint step;
+    std::vector<InFlightItem> items;
+    NnUint nRows;
+    uint64_t tStart;
+    uint64_t tEnd;
+};
+
 // Runs every forward of the root node. Before each forward the scheduling policy picks which
 // admitted requests contribute rows; rows of one batch may belong to different requests.
+// With pipeline parallelism up to `window` forwards (microbatches) are in flight: each stage
+// runs them in order, so a later microbatch always finds the KV cache of the earlier ones.
+// A request can have several prompt chunks in flight but only one decode token.
 class ApiServer {
 private:
     RootLlmInference *inference;
@@ -434,6 +456,8 @@ private:
     std::unique_ptr<SchedPolicy> policy;
     std::vector<bool> isSlotUsed;
     std::vector<std::unique_ptr<ApiRequest>> active; // in admission order
+    std::deque<Microbatch> inFlight;
+    NnUint window;
     NnUint nextRequestId;
     NnUint step;
     FILE *schedLog;
@@ -448,8 +472,9 @@ public:
         this->stops = stops;
         this->templateGenerator = templateGenerator;
         this->pending = pending;
-        this->policy.reset(createSchedPolicy(args->policy, args->rrQuantum));
+        this->policy.reset(createSchedPolicy(args->policy, args->rrQuantum, args->mbMaxRequests));
         this->isSlotUsed.assign(args->maxSlots, false);
+        this->window = inference->nStages > 0 ? args->ppWindow : 1;
         this->nextRequestId = 0;
         this->step = 0;
         this->schedLog = nullptr;
@@ -457,13 +482,17 @@ public:
             schedLog = fopen(args->schedLogPath, "w");
             if (schedLog == nullptr)
                 throw std::runtime_error("Cannot open the scheduler log: " + std::string(args->schedLogPath));
-            fprintf(schedLog, "# policy=%s rr_quantum=%u max_slots=%u n_batches=%u seq_len=%u clock=steady_ns\n",
-                policy->name(), args->rrQuantum, args->maxSlots, args->nBatches, header->seqLen);
+            fprintf(schedLog, "# policy=%s rr_quantum=%u max_slots=%u n_batches=%u seq_len=%u pp_stages=%u window=%u mb_max_requests=%u clock=steady_ns\n",
+                policy->name(), args->rrQuantum, args->maxSlots, args->nBatches, header->seqLen,
+                inference->nStages, window, args->mbMaxRequests);
+            // t_start: the forward starts (pipeline: the microbatch is sent), t_end: its logits are back
             fprintf(schedLog, "# forward,<step>,<t_start>,<t_end>,<batch_size>,<request>:<p|d>:<rows>;...\n");
             fprintf(schedLog, "# request,<id>,<arrive|admit|first_token|finish>,<t>,<detail>\n");
             fflush(schedLog);
         }
         printf("🗓️ Scheduler: %s (rr quantum %u), %u KV-cache slots\n", policy->name(), args->rrQuantum, args->maxSlots);
+        if (inference->nStages > 0)
+            printf("🧩 Pipeline: %u stages, up to %u microbatches in flight\n", inference->nStages, window);
         if (strcmp(policy->name(), "serial") != 0 && args->maxSlots < 2)
             printf("⚠️ With 1 KV-cache slot only one request is served at a time, use --max-slots 2 or more\n");
     }
@@ -477,7 +506,7 @@ public:
         std::vector<SchedRequest *> view;
         std::vector<SchedItem> items;
         while (true) {
-            if (active.empty()) {
+            if (active.empty() && inFlight.empty()) {
                 admit(pending->pop(true));
             }
             while (hasFreeSlot()) {
@@ -490,12 +519,26 @@ public:
             if (active.empty())
                 continue;
 
-            view.clear();
-            for (size_t i = 0; i < active.size(); i++)
-                view.push_back(active[i].get());
-            items.clear();
-            policy->pick(view, args->nBatches, items);
-            forward(items);
+            if (inFlight.size() < window) {
+                view.clear();
+                for (size_t i = 0; i < active.size(); i++) {
+                    ApiRequest *r = active[i].get();
+                    r->ready = isReady(r);
+                    view.push_back(r);
+                }
+                items.clear();
+                policy->pick(view, args->nBatches, items);
+                if (!items.empty()) {
+                    launch(items);
+                    continue;
+                }
+            }
+            if (inFlight.empty())
+                throw std::runtime_error("The scheduler has nothing to run and nothing in flight");
+            // Short waits keep admitting new requests while microbatches are in flight
+            if (!inference->tryCollect(std::chrono::microseconds(200)))
+                continue;
+            complete();
             removeFinished();
         }
     }
@@ -543,6 +586,10 @@ private:
 
             // Prefill writes all prompt tokens but the last one, which is the first decode input
             r->pos = 0;
+            r->schedPos = 0;
+            r->nInFlight = 0;
+            r->decodeInFlight = false;
+            r->ready = true;
             r->token = r->promptTokens[0];
             r->nPrefillLeft = r->promptEndPos;
             r->phase = r->nPrefillLeft > 0 ? SCHED_PREFILL : SCHED_DECODE;
@@ -578,50 +625,79 @@ private:
             finish(r, "max");
     }
 
-    void forward(const std::vector<SchedItem> &items) {
-        std::vector<NnUint> firstRows(items.size());
-        NnUint nRows = 0;
-        for (size_t i = 0; i < items.size(); i++) {
-            firstRows[i] = nRows;
-            nRows += items[i].nTokens;
-        }
-        assert(nRows > 0 && nRows <= args->nBatches);
+    bool isReady(ApiRequest *r) {
+        if (r->finished)
+            return false;
+        if (r->phase == SCHED_PREFILL)
+            return true;
+        // The first decode input is the last prompt token, so it may follow the last prompt
+        // chunk right away; every later one needs the token sampled from the previous forward
+        return !r->decodeInFlight && r->schedPos < r->maxPredPos;
+    }
 
-        inference->setBatchSize(nRows);
+    void launch(const std::vector<SchedItem> &items) {
+        Microbatch mb;
+        mb.step = step++;
+        mb.nRows = 0;
         for (size_t i = 0; i < items.size(); i++) {
             ApiRequest *r = static_cast<ApiRequest *>(items[i].request);
+            mb.items.push_back(InFlightItem{r, items[i].nTokens, mb.nRows, r->phase == SCHED_PREFILL});
+            mb.nRows += items[i].nTokens;
+        }
+        assert(mb.nRows > 0 && mb.nRows <= args->nBatches);
+
+        inference->setBatchSize(mb.nRows);
+        for (const InFlightItem &item : mb.items) {
+            ApiRequest *r = item.request;
             const NnUint slotStart = r->slot * header->seqLen;
-            for (NnUint j = 0; j < items[i].nTokens; j++) {
-                const NnUint row = firstRows[i] + j;
-                inference->setRowPosition(row, slotStart + r->pos + j);
-                inference->setToken(row, r->phase == SCHED_PREFILL ? r->promptTokens[r->pos + j] : r->token);
+            for (NnUint j = 0; j < item.nTokens; j++) {
+                const NnUint row = item.firstRow + j;
+                inference->setRowPosition(row, slotStart + r->schedPos + j);
+                inference->setToken(row, item.isPrefill ? r->promptTokens[r->schedPos + j] : r->token);
             }
         }
 
-        const uint64_t tStart = nowNs();
-        inference->forward();
-        const uint64_t tEnd = nowNs();
-        logForward(items, nRows, tStart, tEnd);
-        step++;
+        mb.tStart = nowNs();
+        inference->submit();
+        mb.tEnd = nowNs(); // tensor parallelism: the forward is done; a pipeline sets it on completion
 
-        for (size_t i = 0; i < items.size(); i++) {
-            ApiRequest *r = static_cast<ApiRequest *>(items[i].request);
-            if (r->phase == SCHED_PREFILL)
-                advancePrefill(r, items[i].nTokens);
-            else
-                decode(r, firstRows[i]);
+        for (const InFlightItem &item : mb.items) {
+            ApiRequest *r = item.request;
+            r->nInFlight++;
+            r->schedPos += item.nTokens;
+            if (item.isPrefill) {
+                r->nPrefillLeft -= item.nTokens;
+                if (r->nPrefillLeft == 0) {
+                    r->phase = SCHED_DECODE;
+                    r->token = r->promptTokens[r->schedPos];
+                }
+            } else {
+                r->decodeInFlight = true;
+            }
         }
+        inFlight.push_back(std::move(mb));
     }
 
-    void advancePrefill(ApiRequest *r, NnUint nTokens) {
-        r->pos += nTokens;
-        r->nPrefillLeft -= nTokens;
-        if (r->nPrefillLeft > 0)
-            return;
-        r->phase = SCHED_DECODE;
-        r->token = r->promptTokens[r->pos];
-        if (r->pos >= r->maxPredPos)
-            finish(r, "max");
+    // The oldest microbatch is back and its logits are in the logits pipe
+    void complete() {
+        Microbatch mb = std::move(inFlight.front());
+        inFlight.pop_front();
+        if (inference->nStages > 0)
+            mb.tEnd = nowNs();
+        logForward(mb);
+
+        for (const InFlightItem &item : mb.items) {
+            ApiRequest *r = item.request;
+            r->nInFlight--;
+            if (item.isPrefill) {
+                r->pos += item.nTokens;
+                if (r->pos == r->promptEndPos && r->pos >= r->maxPredPos)
+                    finish(r, "max");
+            } else {
+                r->decodeInFlight = false;
+                decode(r, item.firstRow);
+            }
+        }
     }
 
     void decode(ApiRequest *r, NnUint row) {
@@ -708,7 +784,7 @@ private:
 
     void removeFinished() {
         for (size_t i = 0; i < active.size();) {
-            if (active[i]->finished) {
+            if (active[i]->finished && active[i]->nInFlight == 0) {
                 policy->onRemove(i);
                 isSlotUsed[active[i]->slot] = false;
                 active.erase(active.begin() + i);
@@ -725,13 +801,13 @@ private:
         fflush(schedLog);
     }
 
-    void logForward(const std::vector<SchedItem> &items, NnUint nRows, uint64_t tStart, uint64_t tEnd) {
+    void logForward(const Microbatch &mb) {
         if (schedLog == nullptr)
             return;
-        fprintf(schedLog, "forward,%u,%llu,%llu,%u,", step, (unsigned long long)tStart, (unsigned long long)tEnd, nRows);
-        for (size_t i = 0; i < items.size(); i++)
-            fprintf(schedLog, "%s%u:%c:%u", i == 0 ? "" : ";", items[i].request->id,
-                items[i].request->phase == SCHED_PREFILL ? 'p' : 'd', items[i].nTokens);
+        fprintf(schedLog, "forward,%u,%llu,%llu,%u,", mb.step, (unsigned long long)mb.tStart, (unsigned long long)mb.tEnd, mb.nRows);
+        for (size_t i = 0; i < mb.items.size(); i++)
+            fprintf(schedLog, "%s%u:%c:%u", i == 0 ? "" : ";", mb.items[i].request->id,
+                mb.items[i].isPrefill ? 'p' : 'd', mb.items[i].nTokens);
         fprintf(schedLog, "\n");
         fflush(schedLog);
     }
@@ -820,7 +896,11 @@ void usage() {
     fprintf(stderr, "        [--seed <s>]\n");
     fprintf(stderr, "        [--max-slots <n>] (KV-cache slots = requests served at once, default 1)\n");
     fprintf(stderr, "        [--policy {serial|rr|concurrent}] [--rr-quantum <forwards>]\n");
+    fprintf(stderr, "        [--mb-max-requests <n>] (concurrent: requests per forward, default no limit)\n");
     fprintf(stderr, "        [--sched-log <csv path>]\n");
+    fprintf(stderr, "        [--pp <stages>] (pipeline parallelism: one stage per worker, in --workers order)\n");
+    fprintf(stderr, "        [--pp-layers <layers of stage 0>,<layers of stage 1>,...] (default: balanced)\n");
+    fprintf(stderr, "        [--pp-window <n>] (microbatches in flight, default the number of stages)\n");
     fprintf(stderr, "Example:\n");
     fprintf(stderr, "  sudo nice -n -20 ./dllama-api --port 9990 --nthreads 4 \\\n");
     fprintf(stderr, "    --model dllama_model_llama3_2_3b_instruct_q40.m \\\n");
