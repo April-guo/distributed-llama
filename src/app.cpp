@@ -47,6 +47,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
+    args.maxSlots = 1;
+    args.policy = (char *)"serial";
+    args.rrQuantum = 1;
+    args.schedLogPath = nullptr;
 
     int i = 1;
     if (requireMode && argc > 1) {
@@ -124,6 +128,14 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.gpuSegmentTo = atoi(separator + 1);
         } else if (std::strcmp(name, "--net-turbo") == 0) {
             args.netTurbo = atoi(value) == 1;
+        } else if (std::strcmp(name, "--max-slots") == 0) {
+            args.maxSlots = (NnUint)atoi(value);
+        } else if (std::strcmp(name, "--policy") == 0) {
+            args.policy = value;
+        } else if (std::strcmp(name, "--rr-quantum") == 0) {
+            args.rrQuantum = (NnUint)atoi(value);
+        } else if (std::strcmp(name, "--sched-log") == 0) {
+            args.schedLogPath = value;
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -131,6 +143,10 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.maxSlots < 1)
+        throw std::runtime_error("Number of slots must be at least 1");
+    if (args.rrQuantum < 1)
+        throw std::runtime_error("Round-robin quantum must be at least 1");
     return args;
 }
 
@@ -173,20 +189,30 @@ RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExe
     this->execution = execution;
     this->executor = executor;
     this->network = network; // May be nullptr!
+    this->nSlots = net->nSlots;
+    const NnUint length = LLM_CONTROL_PACKET_LENGTH(execution->nBatches);
+    this->controlPacket.reset(new NnUint[length]());
+    this->controlPacketSize = length * sizeof(NnUint);
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
     execution->setBatchSize(batchSize);
-    controlPacket.batchSize = batchSize;
+    controlPacket[0] = batchSize;
 }
 
 void RootLlmInference::setPosition(NnUint position) {
     assert(position >= 0);
     assert(position + execution->batchSize - 1 < header->seqLen);
 
-    controlPacket.position = position;
     for (NnUint i = 0; i < execution->batchSize; i++)
-        positionPipe[i] = (float)(position + i);
+        setRowPosition(i, position + i);
+}
+
+void RootLlmInference::setRowPosition(NnUint batchIndex, NnUint position) {
+    assert(batchIndex < execution->batchSize);
+    assert(position < header->seqLen * nSlots);
+    positionPipe[batchIndex] = (float)position;
+    controlPacket[1 + batchIndex] = position;
 }
 
 void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
@@ -196,14 +222,14 @@ void RootLlmInference::setToken(NnUint batchIndex, NnUint token) {
 
 void RootLlmInference::forward() {
     if (network != nullptr) 
-        network->writeAll(&controlPacket, sizeof(LlmControlPacket));
+        network->writeAll(controlPacket.get(), controlPacketSize);
     executor->forward();
 }
 
 void RootLlmInference::finish() {
     if (network != nullptr) {
-        controlPacket.batchSize = 0;
-        network->writeAll(&controlPacket, sizeof(LlmControlPacket));
+        controlPacket[0] = 0;
+        network->writeAll(controlPacket.get(), controlPacketSize);
     }
 }
 
@@ -212,20 +238,25 @@ WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *net
     this->execution = execution;
     this->network = network;
     this->positionPipe = (float *)execution->pipes[0];
+    const NnUint length = LLM_CONTROL_PACKET_LENGTH(execution->nBatches);
+    this->controlPacket.reset(new NnUint[length]());
+    this->controlPacketSize = length * sizeof(NnUint);
 }
 
 bool WorkerLlmInference::tryReadControlPacket() {
     const unsigned long maxAttempts = 10000;
-    if (!network->tryReadWithMaxAttempts(ROOT_SOCKET_INDEX, &controlPacket, sizeof(LlmControlPacket), maxAttempts))
+    if (!network->tryReadWithMaxAttempts(ROOT_SOCKET_INDEX, controlPacket.get(), controlPacketSize, maxAttempts))
         return false;
-    if (controlPacket.batchSize == 0) {
+    const NnUint batchSize = controlPacket[0];
+    if (batchSize == 0) {
         printf("🛑 Stop signal\n");
         isFinished = true;
         return true;
     }
-    for (NnUint i = 0; i < controlPacket.batchSize; i++)
-        positionPipe[i] = (float)(controlPacket.position + i);
-    execution->setBatchSize(controlPacket.batchSize);
+    assert(batchSize <= execution->nBatches);
+    for (NnUint i = 0; i < batchSize; i++)
+        positionPipe[i] = (float)controlPacket[1 + i];
+    execution->setBatchSize(batchSize);
     return true;
 }
 
@@ -245,7 +276,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     Sampler sampler(tokenizer.vocabSize, args->temperature, args->topp, args->seed);
 
-    LlmNet net = buildLlmNet(&header, nNodes, args->nBatches);
+    // Positions travel as floats in the position pipe, which are exact only below 2^24
+    if ((unsigned long long)header.seqLen * args->maxSlots >= (1ull << 24))
+        throw std::runtime_error("seqLen * maxSlots must be below 2^24");
+    LlmNet net = buildLlmNet(&header, nNodes, args->nBatches, args->maxSlots);
+    if (args->info && args->maxSlots > 1)
+        printf("💡 KvCacheSlots: %u\n", args->maxSlots);
     std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];

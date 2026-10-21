@@ -1076,7 +1076,9 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
                     context->queueFamilyIndex,
                     buffer->deviceBuffer,
                     0,
-                    buffer->calcSliceSize(batchSize, netConfig->nBatches)
+                    // Whole buffer: a KV cache is written at any row (slot * seqLen + pos),
+                    // not only in the first batchSize / nBatches of the buffer
+                    VK_WHOLE_SIZE
                 );
                 memoryBarriers.push_back(barrier);
             }

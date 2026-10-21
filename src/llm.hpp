@@ -89,6 +89,7 @@ typedef struct {
     NnUint tokenPipeIndex;
     NnUint xPipeIndex;
     NnUint logitsPipeIndex;
+    NnUint nSlots;
     NnSize3D tokenEmbeddingSize;
     NnSize3D rmsNormSize;
     NnSize3D qkRmsNormSize;
@@ -97,7 +98,7 @@ typedef struct {
 
 LlmHeader loadLlmHeader(const char* path, const unsigned int maxSeqLen, NnFloatType syncType);
 void printLlmHeader(LlmHeader *header);
-LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
+LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots = 1);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
 

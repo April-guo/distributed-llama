@@ -58,7 +58,8 @@ void main() {
 
     barrier();
 
-    const uint position = sharedPosition;
+    // A position is slot * seqLen + pos, the rotation depends only on pos
+    const uint position = sharedPosition % slice.seqLen;
     const BatchInfo info = infos[batchIndex];
 
     const uint xOffset = info.inputOffset;

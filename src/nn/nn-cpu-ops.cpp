@@ -1234,7 +1234,8 @@ static void ropeForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *x = (float *)context->input[batchIndex];
-        const NnUint pos = (NnUint)positions[batchIndex];
+        // A position is slot * seqLen + pos (see sliceKvCache), the rotation depends only on pos
+        const NnUint pos = (NnUint)positions[batchIndex] % slice->seqLen;
         if (config->type == ROPE_LLAMA || config->type == ROPE_LLAMA3_1)
             ropeLlama_F32(x, cache, isQ, pos, slice, nThreads, threadIndex);
         else if (config->type == ROPE_FALCON)
@@ -1265,19 +1266,22 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
     float *valueCache = (float *)context->buffers[config->valueCacheBufferIndex];
     float *att = (float *)context->buffers[config->attBufferIndex];
     const float *positions = (float *)context->pipes[config->positionPipeIndex];
+    const NnUint nKvRows = context->bufferConfigs[config->keyCacheBufferIndex].size.y;
 
     for (NnUint batchIndex = 0; batchIndex < batchSize; batchIndex++) {
         float *y = (float *)context->output[batchIndex];
         float *q = &query[batchIndex * config->qSliceD0];
         NnUint pos = (NnUint)positions[batchIndex];
-        assert(pos < config->seqLen);
+        assert(pos < nKvRows);
+        // Attend only to the request's own slot: rows [slotStart, slotStart + seqLen)
+        const NnUint slotStart = (pos / config->seqLen) * config->seqLen;
 
         DEBUG_VECTOR(context, "input", y);
         DEBUG_VECTOR(context, "q", q);
 
         multiheadAtt_F32(y, q, 
             &att[batchIndex * config->nHeads0 * config->seqLen],
-            keyCache, valueCache, pos,
+            &keyCache[slotStart * config->kvDim0], &valueCache[slotStart * config->kvDim0], pos - slotStart,
             config->nHeads, config->nHeads0,
             config->nKvHeads, config->kvDim0, config->headDim, config->seqLen, nThreads, threadIndex);
 

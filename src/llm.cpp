@@ -148,7 +148,7 @@ void printLlmHeader(LlmHeader *header) {
     }
 }
 
-LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
+LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches, NnUint nSlots) {
     NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
     NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
     NnUint ffDim = h->hiddenDim;
@@ -162,7 +162,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.qkRmsNormSize = size1D(F_32, h->headDim);
     n.moeGateSize = size2D(F_32, h->dim, h->nExperts);
 
-    NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes);
+    NnKvCacheSlice kvCacheSlice = sliceKvCache(h->kvDim, h->seqLen, nNodes, nSlots);
     NnMultiHeadAttSlice multiHeadAttSlice = sliceMultiHeadAtt(h->nHeads, h->seqLen, nNodes, nBatches);
 
     n.qSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->qDim);
@@ -197,6 +197,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     netBuilder.addPreSync(n.positionPipeIndex);
 
     n.header = h;
+    n.nSlots = nSlots;
     n.netConfig = netBuilder.build();
     n.nodeConfigs = new NnNodeConfig[nNodes];
 

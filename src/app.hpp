@@ -39,14 +39,20 @@ public:
     const char *host;
     NnUint port;
 
+    // scheduling (dllama-api)
+    NnUint maxSlots;
+    char *policy;
+    NnUint rrQuantum;
+    char *schedLogPath;
+
     static AppCliArgs parse(int argc, char **argv, bool hasMode);
     ~AppCliArgs();
 };
 
-typedef struct {
-    NnUint position;
-    NnUint batchSize; // 0 = stop signal
-} LlmControlPacket;
+// The control packet is sent to workers before every forward:
+// [batchSize (0 = stop signal), position of row 0, ..., position of row nBatches - 1].
+// A position is slot * seqLen + pos, so the rows of one batch may belong to different requests.
+#define LLM_CONTROL_PACKET_LENGTH(nBatches) ((nBatches) + 1)
 
 class RootLlmInference {
 public:
@@ -58,11 +64,14 @@ private:
     NnNetExecution *execution;
     NnExecutor *executor;
     NnNetwork *network;
-    LlmControlPacket controlPacket;
+    NnUint nSlots;
+    std::unique_ptr<NnUint[]> controlPacket;
+    NnSize controlPacketSize;
 public:
     RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
+    void setRowPosition(NnUint batchIndex, NnUint position);
     void setToken(NnUint batchIndex, NnUint token);
     void forward();
     void finish();
@@ -75,7 +84,8 @@ private:
     float *positionPipe;
     NnNetExecution *execution;
     NnNetwork *network;
-    LlmControlPacket controlPacket;
+    std::unique_ptr<NnUint[]> controlPacket;
+    NnSize controlPacketSize;
 public:
     WorkerLlmInference(NnNetExecution *execution, NnNetwork *network);
     bool tryReadControlPacket();

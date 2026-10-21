@@ -58,11 +58,13 @@ void main() {
     const float invHeadDimRoot = 1.0f / sqrt(float(headDim));
 
     const BatchInfo info = infos[batchIndex];
-    const uint position = sharedPosition;
+    // A position is slot * seqLen + pos, attend only to the request's own slot
+    const uint slotStart = (sharedPosition / seqLen) * seqLen;
+    const uint position = sharedPosition - slotStart;
 
     const uint attOffset = batchIndex * nHeads0 * seqLen + h * seqLen;
     const uint qOffset = batchIndex * qSliceD0 + h * headDim;
-    const uint kvOffset = headIndex * headDim;
+    const uint kvOffset = slotStart * kvDim0 + headIndex * headDim;
     const uint yOffset = info.outputOffset + h * headDim;
 
     float ms = -1e10f;

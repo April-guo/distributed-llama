@@ -208,12 +208,14 @@ NnUint Timer::elapsedMicroseconds() {
 
 // slicers
 
-NnKvCacheSlice sliceKvCache(NnUint kvDim, NnUint seqLen, NnUint nNodes) {
+NnKvCacheSlice sliceKvCache(NnUint kvDim, NnUint seqLen, NnUint nNodes, NnUint nSlots) {
     NnKvCacheSlice s;
     assert(kvDim % nNodes == 0);
+    assert(nSlots > 0);
     s.kvDim0 = kvDim / nNodes;
-    s.keySize = size2D(F_32, seqLen, s.kvDim0);
-    s.valueSize = size2D(F_32, seqLen, s.kvDim0);
+    // Each slot holds the KV cache of one request: rows [slot * seqLen, (slot + 1) * seqLen)
+    s.keySize = size2D(F_32, seqLen * nSlots, s.kvDim0);
+    s.valueSize = size2D(F_32, seqLen * nSlots, s.kvDim0);
     return s;
 }
 
