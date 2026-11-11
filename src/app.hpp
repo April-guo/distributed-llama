@@ -142,6 +142,10 @@ public:
     bool tryCollect(std::chrono::microseconds timeout);
     void collect();
     void finish();
+    // Tensor parallelism only, after a forward: the time (microseconds) the root's executor
+    // spent in its own ops and in node synchronization, and the bytes the root sent and received
+    // since the previous call. The executor measures time only when it was created with a timer.
+    void getForwardStats(NnUint *execUs, NnUint *syncUs, NnSize *sentBytes, NnSize *recvBytes);
 };
 
 class WorkerLlmInference {

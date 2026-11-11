@@ -437,6 +437,12 @@ struct Microbatch {
     NnUint nRows;
     uint64_t tStart;
     uint64_t tEnd;
+    // Tensor parallelism with a scheduler log: the root's time in its ops and in node
+    // synchronization during this forward, and the bytes it sent and received
+    NnUint execUs;
+    NnUint syncUs;
+    NnSize sentBytes;
+    NnSize recvBytes;
 };
 
 // Runs every forward of the root node. Before each forward the scheduling policy picks which
@@ -486,7 +492,10 @@ public:
                 policy->name(), args->rrQuantum, args->maxSlots, args->nBatches, header->seqLen,
                 inference->nStages, window, args->mbMaxRequests);
             // t_start: the forward starts (pipeline: the microbatch is sent), t_end: its logits are back
-            fprintf(schedLog, "# forward,<step>,<t_start>,<t_end>,<batch_size>,<request>:<p|d>:<rows>;...\n");
+            // exec_us / sync_us: the root's time in its own ops / in node synchronization, which
+            // includes waiting for the workers; sent / recv: the root's bytes for this forward.
+            // These four are measured with tensor parallelism only and are 0 with a pipeline.
+            fprintf(schedLog, "# forward,<step>,<t_start>,<t_end>,<batch_size>,<request>:<p|d>:<rows>;...,<exec_us>,<sync_us>,<sent_bytes>,<recv_bytes>\n");
             fprintf(schedLog, "# request,<id>,<arrive|admit|first_token|finish>,<t>,<detail>\n");
             fflush(schedLog);
         }
@@ -657,9 +666,16 @@ private:
             }
         }
 
+        mb.execUs = 0;
+        mb.syncUs = 0;
+        mb.sentBytes = 0;
+        mb.recvBytes = 0;
+
         mb.tStart = nowNs();
         inference->submit();
         mb.tEnd = nowNs(); // tensor parallelism: the forward is done; a pipeline sets it on completion
+        if (schedLog != nullptr && inference->nStages == 0)
+            inference->getForwardStats(&mb.execUs, &mb.syncUs, &mb.sentBytes, &mb.recvBytes);
 
         for (const InFlightItem &item : mb.items) {
             ApiRequest *r = item.request;
@@ -808,7 +824,8 @@ private:
         for (size_t i = 0; i < mb.items.size(); i++)
             fprintf(schedLog, "%s%u:%c:%u", i == 0 ? "" : ";", mb.items[i].request->id,
                 mb.items[i].isPrefill ? 'p' : 'd', mb.items[i].nTokens);
-        fprintf(schedLog, "\n");
+        fprintf(schedLog, ",%u,%u,%llu,%llu\n", mb.execUs, mb.syncUs,
+            (unsigned long long)mb.sentBytes, (unsigned long long)mb.recvBytes);
         fflush(schedLog);
     }
 

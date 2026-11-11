@@ -320,6 +320,17 @@ void RootLlmInference::collect() {
     while (!tryCollect(std::chrono::microseconds(1000000)));
 }
 
+void RootLlmInference::getForwardStats(NnUint *execUs, NnUint *syncUs, NnSize *sentBytes, NnSize *recvBytes) {
+    // With a pipeline the receiver thread reads from the network, so its counters are not ours
+    assert(nStages == 0);
+    *execUs = executor->getTotalTime(STEP_EXECUTE_OP);
+    *syncUs = executor->getTotalTime(STEP_SYNC_NODES);
+    *sentBytes = 0;
+    *recvBytes = 0;
+    if (network != nullptr)
+        network->getStats(sentBytes, recvBytes);
+}
+
 // Reads every microbatch output from the last stage as soon as it arrives, so the last stage can
 // always send. Otherwise the ring root -> stages -> root could deadlock when the root blocks on
 // sending to stage 0 while the last stage blocks on sending to the root.
@@ -500,7 +511,9 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     }
 
     std::vector<NnExecutorDevice> devices = resolveDevices(args, &net.netConfig, rootNodeConfig, &execution);
-    NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(), args->benchmark);
+    // A scheduler log records the per-forward op and sync time, which needs the executor's timer
+    NnExecutor executor(&net.netConfig, rootNodeConfig, &devices, &execution, synchronizer.get(),
+        args->benchmark || args->schedLogPath != nullptr);
 
     std::unique_ptr<NnRootWeightLoader> weightLoader(isPipeline
         ? new LlmPipelineWeightLoader(&executor, network, net.stageEnds)
@@ -634,7 +647,10 @@ void runWorkerApp(AppCliArgs *args) {
 
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
         NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig);
-        NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
+        // --sched-log: a pipeline stage logs its microbatches, a tensor-parallel worker its
+        // forwards; the latter needs the executor's timer for the op and sync time
+        NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer,
+            args->schedLogPath != nullptr);
 
         NnWorkerWeightReader weightReader(&executor, network);
         weightReader.read();
@@ -651,6 +667,20 @@ void runWorkerApp(AppCliArgs *args) {
         }
 
         WorkerLlmInference inference(&execution, network);
+
+        // One line per forward, in the order of the root's forwards. sync_us includes the time
+        // this worker waited for the other nodes.
+        std::unique_ptr<FILE, int(*)(FILE *)> workerLog(nullptr, fclose);
+        NnUint forwardIndex = 0;
+        if (args->schedLogPath != nullptr) {
+            workerLog.reset(fopen(args->schedLogPath, "w"));
+            if (!workerLog)
+                throw std::runtime_error("Cannot open the worker log: " + std::string(args->schedLogPath));
+            fprintf(workerLog.get(), "# tp_worker node=%u clock=steady_ns\n", nodeConfig.nodeIndex);
+            fprintf(workerLog.get(), "# fw,<index>,<batch_size>,<t_start>,<t_end>,<exec_us>,<sync_us>\n");
+            fflush(workerLog.get());
+        }
+
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -676,7 +706,15 @@ void runWorkerApp(AppCliArgs *args) {
                     isTurboEnabled = true;
                     printf("🚁 Network is in non-blocking mode\n");
                 }
+                const uint64_t tStart = appNowNs();
                 executor.forward();
+                if (workerLog) {
+                    fprintf(workerLog.get(), "fw,%u,%u,%llu,%llu,%u,%u\n", forwardIndex, execution.batchSize,
+                        (unsigned long long)tStart, (unsigned long long)appNowNs(),
+                        executor.getTotalTime(STEP_EXECUTE_OP), executor.getTotalTime(STEP_SYNC_NODES));
+                    fflush(workerLog.get());
+                }
+                forwardIndex++;
                 isFirstAttempt = true;
             } catch (const NnTransferSocketException &e) {
                 printf("🚨 Network error: %s\n", e.what());
